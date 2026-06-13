@@ -13,3 +13,6 @@ rebuild: clean build
 
 run: build
 	@$(BUILD_DIR)/prism-server
+
+test: build
+	@$(BUILD_DIR)/prism-test "$(BUILD_DIR)/prism-server"

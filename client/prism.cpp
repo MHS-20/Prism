@@ -364,7 +364,7 @@ PrismReply *prism_arr_at(PrismReply *reply, size_t idx) {
     return &reply->u.arr.items[idx];
 }
 
-void prism_reply_free(PrismReply *reply) {
+static void reply_free_resources(PrismReply *reply) {
     if (!reply) return;
     if (reply->tag == PRISM_ERR) {
         free(reply->u.err.msg);
@@ -372,10 +372,15 @@ void prism_reply_free(PrismReply *reply) {
         free(reply->u.str.data);
     } else if (reply->tag == PRISM_ARR) {
         for (size_t i = 0; i < reply->u.arr.n; i++) {
-            prism_reply_free(&reply->u.arr.items[i]);
+            reply_free_resources(&reply->u.arr.items[i]);
         }
         free(reply->u.arr.items);
     }
+}
+
+void prism_reply_free(PrismReply *reply) {
+    if (!reply) return;
+    reply_free_resources(reply);
     free(reply);
 }
 
