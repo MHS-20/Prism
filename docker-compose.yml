@@ -1,0 +1,20 @@
+version: "3"
+
+services:
+  prism:
+    build: .
+    ports:
+      - "1234:1234"
+    restart: unless-stopped
+
+  prism-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    command: ["ctest", "--test-dir", "/build/build", "--output-on-failure"]
+    depends_on:
+      - prism
+    environment:
+      - PRISM_HOST=prism
+    working_dir: /build
