@@ -49,6 +49,12 @@ PrismReply *prism_zrem(PrismConn *conn, const char *zset, const char *name);
 PrismReply *prism_zscore(PrismConn *conn, const char *zset, const char *name);
 PrismReply *prism_zquery(PrismConn *conn, const char *zset, double score, const char *name, int64_t offset, int64_t limit);
 
+// Pub/sub
+PrismReply *prism_subscribe(PrismConn *conn, const char *channel);
+PrismReply *prism_unsubscribe(PrismConn *conn, const char *channel);
+PrismReply *prism_publish(PrismConn *conn, const char *channel, const char *message);
+PrismReply *prism_read_next(PrismConn *conn);
+
 #ifdef __cplusplus
 }
 #endif

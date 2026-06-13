@@ -62,6 +62,9 @@ All arguments are strings. Numbers are parsed from strings.
 | `zrem` | `zset` `name` | Remove member. Returns 1 if existed |
 | `zscore` | `zset` `name` | Return score of member, or nil |
 | `zquery` | `zset` `score` `name` `offset` `limit` | Query members >= `(score, name)` with pagination. Returns flat array of `[name, score, name, score, ...]` |
+| `subscribe` | `channel [channel ...]` | Subscribe to channels. Puts connection into pub/sub mode (regular commands rejected). Each channel returns `["subscribe", channel, count]` |
+| `unsubscribe` | `[channel ...]` | Unsubscribe from channels. Each channel returns `["unsubscribe", channel, count]`. If no channels given, unsubscribes from all |
+| `publish` | `channel` `message` | Send a message to all subscribers of a channel. Returns the number of subscribers that received it |
 
 ## Architecture
 
@@ -222,6 +225,40 @@ int main() {
 
     prism_close(c);
 }
+```
+
+### Pub/sub example
+
+```c
+PrismConn *sub = prism_connect("127.0.0.1", 1234);
+
+// subscribe to a channel — connection enters pub/sub mode
+PrismReply *r = prism_subscribe(sub, "news");
+// r is ARR(3): ["subscribe", "news", 1]
+prism_reply_free(r);
+
+// publish from another connection
+PrismConn *pub = prism_connect("127.0.0.1", 1234);
+r = prism_publish(pub, "news", "hello");
+printf("sent to %lld subscribers\n", prism_int(r));
+prism_reply_free(r);
+prism_close(pub);
+
+// subscriber reads the push message
+r = prism_read_next(sub);
+// r is ARR(3): ["message", "news", "hello"]
+printf("received: %s\n", prism_str(prism_arr_at(r, 2), NULL));
+prism_reply_free(r);
+
+// unsubscribing exits pub/sub mode
+r = prism_unsubscribe(sub, "news");
+prism_reply_free(r);
+
+// after all channels unsubscribed, regular commands work again
+r = prism_set(sub, "key", "val");
+prism_reply_free(r);
+
+prism_close(sub);
 ```
 
 ## Project layout

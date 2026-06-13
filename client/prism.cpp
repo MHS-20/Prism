@@ -424,3 +424,40 @@ PrismReply *prism_zquery(PrismConn *conn, const char *zset, double score, const 
     snprintf(lbuf, sizeof(lbuf), "%lld", (long long)limit);
     return prism_cmd(conn, 6, "zquery", zset, sbuf, name, obuf, lbuf);
 }
+
+// ---- pub/sub ----
+
+PrismReply *prism_subscribe(PrismConn *conn, const char *channel) {
+    return prism_cmd(conn, 2, "subscribe", channel);
+}
+
+PrismReply *prism_unsubscribe(PrismConn *conn, const char *channel) {
+    return prism_cmd(conn, 2, "unsubscribe", channel);
+}
+
+PrismReply *prism_publish(PrismConn *conn, const char *channel, const char *message) {
+    return prism_cmd(conn, 3, "publish", channel, message);
+}
+
+PrismReply *prism_read_next(PrismConn *conn) {
+    uint8_t rbuf[4];
+    if (!recv_all(conn->fd, rbuf, 4)) return NULL;
+    uint32_t resp_len = 0;
+    memcpy(&resp_len, rbuf, 4);
+    if (resp_len > k_max_msg) return NULL;
+
+    uint8_t *resp = (uint8_t *)malloc(resp_len);
+    if (!recv_all(conn->fd, resp, resp_len)) {
+        free(resp);
+        return NULL;
+    }
+
+    PrismReply *reply = (PrismReply *)calloc(1, sizeof(PrismReply));
+    int ok = parse_reply_body(resp, resp_len, reply) ? 1 : 0;
+    free(resp);
+    if (!ok) {
+        prism_reply_free(reply);
+        return NULL;
+    }
+    return reply;
+}

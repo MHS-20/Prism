@@ -205,6 +205,93 @@ static void test_zset(PrismConn *c) {
     prism_reply_free(r);
 }
 
+static void test_pubsub(PrismConn *c) {
+    PrismConn *sub = prism_connect("127.0.0.1", 1234);
+    if (!sub) { CHECK(0, "sub connect"); return; }
+
+    PrismReply *r;
+    const char *s;
+    int64_t n;
+    size_t len;
+
+    r = prism_subscribe(sub, "news");
+    if (!r) { CHECK(0, "subscribe reply non-null"); goto cleanup; }
+    CHECK(prism_type(r) == PRISM_ARR && prism_arr_len(r) == 3, "subscribe ack is arr(3)");
+    s = prism_str(prism_arr_at(r, 0), NULL);
+    CHECK(s && strcmp(s, "subscribe") == 0, "subscribe ack type");
+    s = prism_str(prism_arr_at(r, 1), NULL);
+    CHECK(s && strcmp(s, "news") == 0, "subscribe ack channel");
+    n = prism_int(prism_arr_at(r, 2));
+    CHECK(n == 1, "subscribe ack count == 1");
+    prism_reply_free(r);
+    r = prism_subscribe(sub, "news");
+    if (!r) { CHECK(0, "subscribe again reply non-null"); goto cleanup; }
+    CHECK(prism_type(r) == PRISM_ARR && prism_arr_len(r) == 3, "subscribe again ack is arr(3)");
+    CHECK(prism_int(prism_arr_at(r, 2)) == 1, "subscribe again count still 1");
+    prism_reply_free(r);
+
+    // subscribe to a second channel
+    r = prism_subscribe(sub, "sports");
+    prism_reply_free(r);
+
+    // unsubscribe
+    r = prism_unsubscribe(sub, "news");
+    if (!r) { CHECK(0, "unsubscribe reply non-null"); goto cleanup; }
+    CHECK(prism_type(r) == PRISM_ARR && prism_arr_len(r) == 3, "unsubscribe ack is arr(3)");
+    s = prism_str(prism_arr_at(r, 0), NULL);
+    CHECK(s && strcmp(s, "unsubscribe") == 0, "unsubscribe ack type");
+    s = prism_str(prism_arr_at(r, 1), NULL);
+    CHECK(s && strcmp(s, "news") == 0, "unsubscribe ack channel");
+    n = prism_int(prism_arr_at(r, 2));
+    CHECK(n == 1, "unsubscribe ack count == 1");
+    prism_reply_free(r);
+
+    // subscribe back to news
+    r = prism_subscribe(sub, "news");
+    prism_reply_free(r);
+
+    // publish from another connection, then read push on subscriber
+    r = prism_publish(c, "news", "hello subscribers");
+    if (!r) { CHECK(0, "publish reply non-null"); goto cleanup; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) >= 1, "publish returns subscriber count >= 1");
+    prism_reply_free(r);
+
+    // subscriber reads the push message
+    r = prism_read_next(sub);
+    if (!r) { CHECK(0, "read_next reply non-null"); goto cleanup; }
+    CHECK(prism_type(r) == PRISM_ARR && prism_arr_len(r) == 3, "push message is arr(3)");
+    s = prism_str(prism_arr_at(r, 0), NULL);
+    CHECK(s && strcmp(s, "message") == 0, "push message type");
+    s = prism_str(prism_arr_at(r, 1), NULL);
+    CHECK(s && strcmp(s, "news") == 0, "push message channel");
+    s = prism_str(prism_arr_at(r, 2), &len);
+    CHECK(s && len == 17 && memcmp(s, "hello subscribers", 17) == 0, "push message body");
+    prism_reply_free(r);
+
+    // subscribing client rejects regular commands
+    r = prism_get(sub, "shouldfail");
+    if (!r) { CHECK(0, "get reply non-null"); goto cleanup; }
+    CHECK(prism_type(r) == PRISM_ERR, "get in pub/sub mode returns error");
+    prism_reply_free(r);
+
+    // unsubscribe all
+    r = prism_unsubscribe(sub, "sports");
+    if (!r) { CHECK(0, "unsubscribe sports reply non-null"); goto cleanup; }
+    prism_reply_free(r);
+    r = prism_unsubscribe(sub, "news");
+    if (!r) { CHECK(0, "unsubscribe news reply non-null"); goto cleanup; }
+    prism_reply_free(r);
+
+    // after all unsubscribes, regular commands work again
+    r = prism_set(sub, "after_unsub", "ok");
+    if (!r) { CHECK(0, "set after unsubscribe reply non-null"); goto cleanup; }
+    CHECK(prism_type(r) == PRISM_NIL, "set works after unsubscribing all");
+    prism_reply_free(r);
+
+cleanup:
+    prism_close(sub);
+}
+
 int main(int argc, char **argv) {
     const char *server_path = "./build/prism-server";
     if (argc > 1) {
@@ -249,6 +336,7 @@ int main(int argc, char **argv) {
     test_ttl(c);
     test_keys(c);
     test_zset(c);
+    test_pubsub(c);
 
     prism_close(c);
 

@@ -17,6 +17,8 @@
 // C++
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <algorithm>
 // proj
 #include "common.h"
 #include "hashtable.h"
@@ -87,6 +89,9 @@ struct Conn {
     // timer
     uint64_t last_active_ms = 0;
     DList idle_node;
+    // pub/sub
+    bool subscribed = false;
+    std::vector<std::string> channels;
 };
 
 // global states
@@ -100,6 +105,8 @@ static struct {
     std::vector<HeapItem> heap;
     // the thread pool
     TheadPool thread_pool;
+    // pub/sub: channel -> subscribers
+    std::unordered_map<std::string, std::vector<Conn *>> subs;
 } g_data;
 
 // application callback when the listening socket is ready
@@ -138,6 +145,20 @@ static int32_t handle_accept(int fd) {
 }
 
 static void conn_destroy(Conn *conn) {
+    // remove from pub/sub channels
+    for (const std::string &ch : conn->channels) {
+        auto it = g_data.subs.find(ch);
+        if (it != g_data.subs.end()) {
+            std::vector<Conn *> &vec = it->second;
+            vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
+            if (vec.empty()) {
+                g_data.subs.erase(it);
+            }
+        }
+    }
+    conn->channels.clear();
+    conn->subscribed = false;
+
     (void)close(conn->fd);
     g_data.fd2conn[conn->fd] = NULL;
     dlist_detach(&conn->idle_node);
@@ -594,7 +615,107 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
     out_end_arr(out, ctx, (uint32_t)n);
 }
 
-static void do_request(std::vector<std::string> &cmd, Buffer &out) {
+static void response_begin(Buffer &out, size_t *header);
+static void response_end(Buffer &out, size_t header);
+
+// subscribe channel [channel ...]
+static void do_subscribe(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
+    for (size_t i = 1; i < cmd.size(); i++) {
+        const std::string &channel = cmd[i];
+        auto it = std::find(conn->channels.begin(), conn->channels.end(), channel);
+        if (it == conn->channels.end()) {
+            conn->channels.push_back(channel);
+            g_data.subs[channel].push_back(conn);
+        }
+        out_arr(out, 3);
+        out_str(out, "subscribe", 9);
+        out_str(out, channel.data(), channel.size());
+        out_int(out, (int64_t)conn->channels.size());
+    }
+    conn->subscribed = true;
+}
+
+// unsubscribe [channel ...]
+static void do_unsubscribe(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
+    if (cmd.size() == 1) {
+        // unsubscribe all
+        std::vector<std::string> all = conn->channels;
+        for (size_t i = 0; i < all.size(); i++) {
+            auto it = g_data.subs.find(all[i]);
+            if (it != g_data.subs.end()) {
+                std::vector<Conn *> &vec = it->second;
+                vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
+                if (vec.empty()) {
+                    g_data.subs.erase(it);
+                }
+            }
+            out_arr(out, 3);
+            out_str(out, "unsubscribe", 11);
+            out_str(out, all[i].data(), all[i].size());
+            out_int(out, (int64_t)(all.size() - 1 - i));
+        }
+        conn->channels.clear();
+        conn->subscribed = false;
+    } else {
+        for (size_t i = 1; i < cmd.size(); i++) {
+            const std::string &channel = cmd[i];
+            auto it = std::find(conn->channels.begin(), conn->channels.end(), channel);
+            if (it != conn->channels.end()) {
+                conn->channels.erase(it);
+                auto sit = g_data.subs.find(channel);
+                if (sit != g_data.subs.end()) {
+                    std::vector<Conn *> &vec = sit->second;
+                    vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
+                    if (vec.empty()) {
+                        g_data.subs.erase(sit);
+                    }
+                }
+            }
+            out_arr(out, 3);
+            out_str(out, "unsubscribe", 11);
+            out_str(out, channel.data(), channel.size());
+            out_int(out, (int64_t)conn->channels.size());
+        }
+        if (conn->channels.empty()) {
+            conn->subscribed = false;
+        }
+    }
+}
+
+// publish channel message
+static void do_publish(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
+    const std::string &channel = cmd[1];
+    const std::string &msg = cmd[2];
+
+    auto it = g_data.subs.find(channel);
+    int64_t count = 0;
+    if (it != g_data.subs.end()) {
+        // build the message notification frame
+        Buffer notification;
+        size_t header;
+        response_begin(notification, &header);
+        out_arr(notification, 3);
+        out_str(notification, "message", 7);
+        out_str(notification, channel.data(), channel.size());
+        out_str(notification, msg.data(), msg.size());
+        response_end(notification, header);
+
+        for (Conn *sub : it->second) {
+            buf_append(sub->outgoing, notification.data(), notification.size());
+            sub->want_read = false;
+            sub->want_write = true;
+        }
+        count = (int64_t)it->second.size();
+    }
+
+    out_int(out, count);
+}
+
+static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
+    if (conn->subscribed && cmd[0] != "subscribe" && cmd[0] != "unsubscribe") {
+        return out_err(out, ERR_UNKNOWN, "only subscribe/unsubscribe allowed in pub/sub mode");
+    }
+
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
@@ -615,6 +736,15 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_zscore(cmd, out);
     } else if (cmd.size() == 6 && cmd[0] == "zquery") {
         return do_zquery(cmd, out);
+    } else if (cmd[0] == "subscribe") {
+        if (cmd.size() < 2) {
+            return out_err(out, ERR_BAD_ARG, "wrong number of arguments for subscribe");
+        }
+        return do_subscribe(cmd, conn, out);
+    } else if (cmd[0] == "unsubscribe") {
+        return do_unsubscribe(cmd, conn, out);
+    } else if (cmd.size() == 3 && cmd[0] == "publish") {
+        return do_publish(cmd, conn, out);
     } else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
@@ -667,7 +797,7 @@ static bool try_one_request(Conn *conn) {
     }
     size_t header_pos = 0;
     response_begin(conn->outgoing, &header_pos);
-    do_request(cmd, conn->outgoing);
+    do_request(cmd, conn, conn->outgoing);
     response_end(conn->outgoing, header_pos);
 
     // application logic done! remove the request message.

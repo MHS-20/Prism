@@ -3,7 +3,7 @@
 ## Protocol / compatibility
 
 - RESP (Redis Serialization Protocol) compatibility layer — let `redis-cli` talk directly
-- Pub/sub channels (`SUBSCRIBE`, `PUBLISH`, `UNSUBSCRIBE`)
+- ~~Pub/sub channels (`SUBSCRIBE`, `PUBLISH`, `UNSUBSCRIBE`)~~ **done**
 
 ## Persistence
 
@@ -36,6 +36,7 @@
 - Connection pooling / auto-reconnect
 - Async (non-blocking) API
 - Pipelining helper — batch commands without waiting between individual responses
+- `prism_read_next` for reading push messages in pub/sub — **done**
 
 ## Internals / polish
 
