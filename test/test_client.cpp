@@ -453,6 +453,79 @@ static void test_misc(PrismConn *c) {
     prism_reply_free(r);
 }
 
+static void test_client_features(PrismConn *c) {
+    PrismReply *r;
+
+    // ---- pipelining ----
+    // send 3 commands without waiting
+    CHECK(prism_send(c, 3, "set", "pipe1", "x") == 0, "pipeline send set");
+    CHECK(prism_send(c, 3, "set", "pipe2", "y") == 0, "pipeline send set 2");
+    CHECK(prism_send(c, 1, "keys") == 0, "pipeline send keys");
+
+    // read 3 responses
+    r = prism_read_next(c);
+    if (!r) { CHECK(0, "pipeline recv 1"); return; }
+    CHECK(prism_type(r) == PRISM_NIL, "pipeline response 1 nil");
+    prism_reply_free(r);
+
+    r = prism_read_next(c);
+    if (!r) { CHECK(0, "pipeline recv 2"); return; }
+    CHECK(prism_type(r) == PRISM_NIL, "pipeline response 2 nil");
+    prism_reply_free(r);
+
+    r = prism_read_next(c);
+    if (!r) { CHECK(0, "pipeline recv 3"); return; }
+    CHECK(prism_type(r) == PRISM_ARR, "pipeline response 3 arr");
+    prism_reply_free(r);
+
+    // ---- non-blocking helpers ----
+    int fd = prism_fd(c);
+    CHECK(fd >= 0, "prism_fd returns valid fd");
+
+    int rv = prism_set_nonblock(c, 1);
+    CHECK(rv == 0, "set nonblock returns 0");
+    rv = prism_set_nonblock(c, 0);
+    CHECK(rv == 0, "set blocking returns 0");
+
+    // ---- connection pool ----
+    PrismPool *pool = prism_pool_new("127.0.0.1", 1234, 3);
+    CHECK(pool != NULL, "pool created");
+
+    PrismConn *c1 = prism_pool_get(pool);
+    CHECK(c1 != NULL, "pool get 1");
+
+    PrismConn *c2 = prism_pool_get(pool);
+    CHECK(c2 != NULL, "pool get 2");
+
+    PrismConn *c3 = prism_pool_get(pool);
+    CHECK(c3 != NULL, "pool get 3");
+
+    PrismConn *c4 = prism_pool_get(pool);
+    CHECK(c4 == NULL, "pool exhausted returns NULL");
+
+    // release and reuse
+    prism_pool_release(pool, c2);
+    PrismConn *c2again = prism_pool_get(pool);
+    CHECK(c2again == c2, "pool reuses released connection");
+
+    // use connection from pool
+    r = prism_cmd(c2again, 3, "set", "poolkey", "ok");
+    if (!r) { CHECK(0, "pool set cmd reply"); return; }
+    CHECK(prism_type(r) == PRISM_NIL, "pool can set");
+    prism_reply_free(r);
+
+    r = prism_cmd(c2again, 2, "get", "poolkey");
+    if (!r) { CHECK(0, "pool get cmd reply"); return; }
+    CHECK(prism_type(r) == PRISM_STR, "pool connection works");
+    prism_reply_free(r);
+
+    // clean up pool
+    prism_pool_release(pool, c1);
+    prism_pool_release(pool, c2again);
+    prism_pool_release(pool, c3);
+    prism_pool_free(pool);
+}
+
 static void test_pubsub(PrismConn *c) {
     PrismConn *sub = prism_connect("127.0.0.1", 1234);
     if (!sub) { CHECK(0, "sub connect"); return; }
@@ -636,6 +709,7 @@ int main(int argc, char **argv) {
     test_hash(c);
     test_bitmap(c);
     test_misc(c);
+    test_client_features(c);
     test_pubsub(c);
     test_persistence(c);
 
