@@ -19,38 +19,6 @@ A minimal key-value Cache and Data Structure Server.
 - Idle connection timeout (5 s)
 - Zero external dependencies — standard C/C++ libs + pthreads
 
-## Build
-
-### CMake (recommended)
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-### Make wrapper
-
-```sh
-make          # configure + build (Release)
-make run      # build and run
-make clean    # remove build directory
-make rebuild  # clean then build
-```
-
-### Direct compilation (no build system)
-
-```sh
-g++ -O2 -std=c++11 -pthread src/*.cpp -o prism
-```
-
-## Run
-
-```sh
-./build/prism
-```
-
-Listens on `0.0.0.0:1234`. No config file, no CLI flags.
-
 ## Wire Protocol
 
 Every message — request and response — follows the same frame format:
@@ -97,19 +65,7 @@ All arguments are strings. Numbers are parsed from strings.
 
 ## Architecture
 
-```
-src/
-├── common.h        — container_of macro, FNV-1a hash
-├── list.h          — intrusive doubly-linked list (idle connections)
-├── avl.h / .cpp    — AVL tree (sorted-set order, rank queries)
-├── hashtable.h/.cpp— 2-table hash map with progressive rehashing
-├── heap.h / .cpp   — binary min-heap (TTL expiry)
-├── zset.h / .cpp   — sorted set: AVL tree by (score, name) + hash map by name
-├── thread_pool.h/.cpp — fixed-size thread pool (zset cleanup)
-└── server.cpp      — entrypoint, poll event loop, protocol, commands
-```
-
-### Event loop (`server.cpp:802`)
+### Event loop
 
 `poll()` dispatches between:
 
@@ -117,79 +73,173 @@ src/
 2. **Client sockets** — read requests, write responses, handle errors
 3. **Timers** — expire idle connections (linked list) and TTL'd keys (min-heap)
 
-### Hash table (`hashtable.cpp`)
+### Hash table
 
 Open-addressed chained hash table using separate chaining. Wrapped in `HMap` which maintains two `HTab` instances for **progressive rehashing**: when the active table exceeds the load factor (8), a new table is allocated and entries migrate incrementally (128 per insert/lookup/delete). No GC pause.
 
-### Sorted set (`zset.cpp`)
+### Sorted set
 
 Two-index structure:
 
 - **AVL tree** ordered by `(score, name)` — enables range queries (`zquery`) and offset-based pagination via subtree-size caching
 - **Hash map** keyed by `name` — O(1) lookup by member name (`zscore`, `zrem`, `zadd` update)
 
-### AVL tree (`avl.cpp`)
+### AVL tree
 
 Self-balancing binary search tree. Each node caches `height` (balance factor) and `cnt` (subtree size). The `cnt` field enables O(log N) rank-based traversal (`avl_offset`), used by `zquery` pagination.
 
-### TTL heap (`heap.cpp`)
+### TTL heap
 
 Binary min-heap keyed by absolute expiry timestamp. Each `Entry` stores its heap slot index for O(log N) update/removal.
 
-### Thread pool (`thread_pool.cpp`)
+### Thread pool
 
 4 worker threads wait on a condition variable. When a large zset (≥1000 members) is deleted, the destructor is offloaded to the pool to avoid blocking the event loop.
 
-## Example client
+## Build
 
-Using a shell with `od` and `/dev/tcp`:
+### CMake
 
 ```sh
-# set foo bar
-printf '\x07\x00\x00\x00'                           # msg_len = 7
-printf '\x02\x00\x00\x00'                           # nargs = 2
-printf '\x03\x00\x00\x00foo'                        # arg: "foo"
-printf '\x03\x00\x00\x00bar'                        # arg: "bar"
-# (piped to /dev/tcp/localhost/1234, read response)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
-Or with Python:
+### Make wrapper
 
-```python
-import socket, struct
-
-s = socket.socket()
-s.connect(('127.0.0.1', 1234))
-
-def send_cmd(*args):
-    body = struct.pack('<I', len(args))
-    for a in args:
-        body += struct.pack('<I', len(a)) + a.encode()
-    s.sendall(struct.pack('<I', len(body)) + body)
-
-def read_response():
-    data = s.recv(4)
-    (n,) = struct.unpack('<I', data)
-    return s.recv(n)
-
-send_cmd('set', 'hello', 'world')
-print(read_response())   # b'\x00' (nil)
-
-send_cmd('get', 'hello')
-print(read_response())   # b'\x02\x05\x00\x00\x00world' (STR)
+```sh
+make          # configure + build (Release)
+make run      # build and run
+make clean    # remove build directory
+make rebuild  # clean then build
 ```
 
-## Data structures summary
+### Direct compilation (server only, no client library)
+
+```sh
+g++ -O2 -std=c++11 -pthread server/*.cpp -o prism-server
+```
+
+## Run
+
+```sh
+./build/prism-server
+```
+
+Listens on `0.0.0.0:1234`. No config file, no CLI flags.
+
+## Client library
+
+The `client/` directory provides a C/C++ library (`prism.h` / `prism.cpp`) for speaking the protocol. Build as a static library:
+
+```sh
+g++ -std=c++11 -c client/prism.cpp -o prism-client.o
+ar rcs libprism-client.a prism-client.o
+```
+
+Or link via CMake: `target_link_libraries(your_app prism-client)`.
+
+### API
+
+```c
+// Connection lifecycle
+PrismConn *prism_connect(const char *host, uint16_t port);
+void prism_close(PrismConn *conn);
+
+// Send arbitrary command (NULL-terminated args)
+PrismReply *prism_cmd(PrismConn *conn, int nargs, ...);
+PrismReply *prism_cmdv(PrismConn *conn, const char **args, int nargs);
+
+// Reply inspection
+PrismType  prism_type(PrismReply *reply);
+const char *prism_err_msg(PrismReply *reply, uint32_t *code);
+const char *prism_str(PrismReply *reply, size_t *len);
+int64_t     prism_int(PrismReply *reply);
+double      prism_dbl(PrismReply *reply);
+size_t      prism_arr_len(PrismReply *reply);
+PrismReply *prism_arr_at(PrismReply *reply, size_t idx);
+void        prism_reply_free(PrismReply *reply);
+
+// Convenience wrappers for each command
+PrismReply *prism_get(PrismConn *, const char *key);
+PrismReply *prism_set(PrismConn *, const char *key, const char *val);
+PrismReply *prism_del(PrismConn *, const char *key);
+PrismReply *prism_pexpire(PrismConn *, const char *key, int64_t ttl_ms);
+PrismReply *prism_pttl(PrismConn *, const char *key);
+PrismReply *prism_keys(PrismConn *);
+PrismReply *prism_zadd(PrismConn *, const char *zset, double score, const char *name);
+PrismReply *prism_zrem(PrismConn *, const char *zset, const char *name);
+PrismReply *prism_zscore(PrismConn *, const char *zset, const char *name);
+PrismReply *prism_zquery(PrismConn *, const char *zset, double score, const char *name, int64_t offset, int64_t limit);
+```
+
+## Usage example
+
+CMake builds both `prism-server` and `libprism-client.a`. Link your own program against the client library:
+
+```sh
+g++ -std=c++11 -Iclient example.cpp -Lbuild -lprism-client -o example
+```
+
+Or add to your `CMakeLists.txt`:
+
+```cmake
+add_subdirectory(path/to/prism)
+target_link_libraries(your_app prism-client)
+```
+
+```cpp
+#include "prism.h"
+#include <stdio.h>
+
+int main() {
+    PrismConn *c = prism_connect("127.0.0.1", 1234);
+    if (!c) { perror("connect"); return 1; }
+
+    PrismReply *r;
+
+    r = prism_set(c, "hello", "world");
+    prism_reply_free(r);
+
+    r = prism_get(c, "hello");
+    size_t len;
+    const char *s = prism_str(r, &len);
+    printf("got: %.*s\n", (int)len, s);
+    prism_reply_free(r);
+
+    r = prism_zadd(c, "scores", 99.5, "alice");
+    printf("zadd new: %lld\n", prism_int(r));
+    prism_reply_free(r);
+
+    r = prism_zquery(c, "scores", 0, "", 0, 10);
+    size_t n = prism_arr_len(r);
+    for (size_t i = 0; i < n; i += 2) {
+        const char *name = prism_str(prism_arr_at(r, i), NULL);
+        double score = prism_dbl(prism_arr_at(r, i + 1));
+        printf("  %s: %.2f\n", name, score);
+    }
+    prism_reply_free(r);
+
+    prism_close(c);
+}
+```
+
+## Project layout
+
+| Path | Role |
+|---|---|
+| `server/` | Server source (event loop, data structures, protocol) |
+| `client/` | Client library (`prism.h`, `prism.cpp`) |
+| `CMakeLists.txt` | Top-level CMake (builds both targets) |
+| `Makefile` | Convenience wrapper for CMake |
+
+### Data structures
 
 | Structure | File | Used for |
 |---|---|---|
-| `HMap` (2× `HTab`) | `hashtable.h/.cpp` | Top-level KV store, zset name index |
-| `AVLNode` | `avl.h/.cpp` | Zset ordering by `(score, name)`, rank queries |
-| `ZSet` / `ZNode` | `zset.h/.cpp` | Sorted set abstraction |
-| `HeapItem` | `heap.h/.cpp` | TTL expiry queue |
-| `DList` | `list.h` | Idle connection LRU |
-| `TheadPool` | `thread_pool.h/.cpp` | Async large-object cleanup |
-
-## Licence
-
-MIT
+| `HMap` (2× `HTab`) | `server/hashtable.h/.cpp` | Top-level KV store, zset name index |
+| `AVLNode` | `server/avl.h/.cpp` | Zset ordering by `(score, name)`, rank queries |
+| `ZSet` / `ZNode` | `server/zset.h/.cpp` | Sorted set abstraction |
+| `HeapItem` | `server/heap.h/.cpp` | TTL expiry queue |
+| `DList` | `server/list.h` | Idle connection LRU |
+| `TheadPool` | `server/thread_pool.h/.cpp` | Async large-object cleanup |

@@ -1,6 +1,6 @@
 BUILD_DIR ?= build
 
-.PHONY: build clean rebuild run
+.PHONY: build clean rebuild run run-client
 
 build:
 	@cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
@@ -12,4 +12,4 @@ clean:
 rebuild: clean build
 
 run: build
-	@$(BUILD_DIR)/prism
+	@$(BUILD_DIR)/prism-server
