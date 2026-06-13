@@ -373,6 +373,86 @@ static void test_bitmap(PrismConn *c) {
     prism_reply_free(r);
 }
 
+static void test_misc(PrismConn *c) {
+    PrismReply *r;
+
+    // EXISTS
+    r = prism_cmd(c, 2, "exists", "nonexist");
+    if (!r) { CHECK(0, "exists reply"); return; }
+    CHECK(prism_int(r) == 0, "exists non-existent returns 0");
+    prism_reply_free(r);
+
+    r = prism_set(c, "exkey", "val");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "exists", "exkey");
+    CHECK(prism_int(r) == 1, "exists existing returns 1");
+    prism_reply_free(r);
+
+    // TYPE
+    r = prism_cmd(c, 2, "type", "nonexist");
+    if (!r) { CHECK(0, "type reply"); return; }
+    const char *t = prism_str(r, NULL);
+    CHECK(t && strcmp(t, "none") == 0, "type non-existent is none");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "type", "exkey");
+    t = prism_str(r, NULL);
+    CHECK(t && strcmp(t, "string") == 0, "type string is string");
+    prism_reply_free(r);
+
+    // STRLEN
+    r = prism_cmd(c, 2, "strlen", "nonexist");
+    CHECK(prism_int(r) == 0, "strlen non-existent returns 0");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "strlen", "exkey");
+    CHECK(prism_int(r) == 3, "strlen 'val' returns 3");
+    prism_reply_free(r);
+
+    // RENAME
+    r = prism_cmd(c, 3, "rename", "exkey", "newkey");
+    if (!r) { CHECK(0, "rename reply"); return; }
+    CHECK(prism_type(r) == PRISM_NIL, "rename returns nil");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "exists", "exkey");
+    CHECK(prism_int(r) == 0, "old key gone after rename");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "exists", "newkey");
+    CHECK(prism_int(r) == 1, "new key exists after rename");
+    prism_reply_free(r);
+
+    r = prism_get(c, "newkey");
+    CHECK(prism_type(r) == PRISM_STR, "renamed key has value");
+    prism_reply_free(r);
+
+    // SCAN
+    r = prism_cmd(c, 2, "scan", "0");
+    if (!r) { CHECK(0, "scan reply"); return; }
+    CHECK(prism_type(r) == PRISM_ARR && prism_arr_len(r) >= 1, "scan returns array");
+    int64_t next_cursor = prism_int(prism_arr_at(r, 0));
+    CHECK(next_cursor == 0, "scan complete (next cursor 0)");
+    prism_reply_free(r);
+
+    // DEBUG
+    r = prism_cmd(c, 1, "debug");
+    if (!r) { CHECK(0, "debug reply"); return; }
+    CHECK(prism_type(r) == PRISM_ARR, "debug returns array");
+    prism_reply_free(r);
+
+    // OBJECT
+    r = prism_cmd(c, 2, "object", "newkey");
+    if (!r) { CHECK(0, "object reply"); return; }
+    CHECK(prism_type(r) == PRISM_ARR, "object returns array");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "object", "nonexist");
+    CHECK(prism_type(r) == PRISM_NIL, "object non-existent returns nil");
+    prism_reply_free(r);
+}
+
 static void test_pubsub(PrismConn *c) {
     PrismConn *sub = prism_connect("127.0.0.1", 1234);
     if (!sub) { CHECK(0, "sub connect"); return; }
@@ -555,6 +635,7 @@ int main(int argc, char **argv) {
     test_list(c);
     test_hash(c);
     test_bitmap(c);
+    test_misc(c);
     test_pubsub(c);
     test_persistence(c);
 

@@ -917,6 +917,141 @@ static void do_bitcount(std::vector<std::string> &cmd, Buffer &out) {
     out_int(out, count);
 }
 
+// ---- misc commands ----
+
+// EXISTS key
+static void do_exists(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    out_int(out, node ? 1 : 0);
+}
+
+// TYPE key
+static void do_type(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) return out_str(out, "none", 4);
+    Entry *ent = container_of(node, Entry, node);
+    const char *tn = NULL;
+    switch (ent->type) {
+        case T_STR:  tn = "string"; break;
+        case T_ZSET: tn = "zset";   break;
+        case T_LIST: tn = "list";   break;
+        case T_HASH: tn = "hash";   break;
+        default:     tn = "unknown"; break;
+    }
+    out_str(out, tn, strlen(tn));
+}
+
+// STRLEN key
+static void do_strlen(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) return out_int(out, 0);
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string");
+    out_int(out, (int64_t)ent->str.size());
+}
+
+// RENAME key newkey
+static void do_rename(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey old_key;
+    old_key.key = cmd[1];
+    old_key.node.hcode = str_hash((uint8_t *)old_key.key.data(), old_key.key.size());
+    HNode *node = hm_delete(&g_data.db, &old_key.node, &entry_eq);
+    if (!node) return out_err(out, ERR_UNKNOWN, "no such key");
+
+    Entry *ent = container_of(node, Entry, node);
+
+    // delete target if exists
+    LookupKey new_key;
+    new_key.key = cmd[2];
+    new_key.node.hcode = str_hash((uint8_t *)new_key.key.data(), new_key.key.size());
+    HNode *existing = hm_delete(&g_data.db, &new_key.node, &entry_eq);
+    if (existing) entry_del(container_of(existing, Entry, node));
+
+    ent->key = cmd[2];
+    ent->node.hcode = new_key.node.hcode;
+    hm_insert(&g_data.db, &ent->node);
+    out_nil(out);
+}
+
+// SCAN cursor [COUNT n]
+static void do_scan(std::vector<std::string> &cmd, Buffer &out) {
+    int64_t cursor = 0;
+    if (!str2int(cmd[1], cursor) || cursor < 0) {
+        return out_err(out, ERR_BAD_ARG, "expect uint cursor");
+    }
+    int64_t count = 10;
+    for (size_t i = 2; i + 1 < cmd.size(); i++) {
+        if (cmd[i] == "count" && str2int(cmd[i + 1], count)) break;
+    }
+    if (count < 1) count = 1;
+
+    size_t total = hm_size(&g_data.db);
+    size_t skip = (size_t)cursor;
+    std::vector<std::string> keys;
+
+    if (skip < total) {
+        struct { size_t *skip; int64_t count; std::vector<std::string> *keys; } ctx;
+        ctx.skip = &skip; ctx.count = count; ctx.keys = &keys;
+        hm_foreach(&g_data.db, [](HNode *hnode, void *arg) -> bool {
+            auto *c = (decltype(ctx) *)arg;
+            if (*c->skip > 0) { (*c->skip)--; return true; }
+            if ((int64_t)c->keys->size() >= c->count) return false;
+            c->keys->push_back(container_of(hnode, Entry, node)->key);
+            return true;
+        }, &ctx);
+    }
+
+    int64_t next = (int64_t)keys.size() < count ? 0 : cursor + (int64_t)keys.size();
+    out_arr(out, (uint32_t)(1 + keys.size()));
+    out_int(out, next);
+    for (size_t i = 0; i < keys.size(); i++) {
+        out_str(out, keys[i].data(), keys[i].size());
+    }
+}
+
+// DEBUG
+static void do_debug(std::vector<std::string> &, Buffer &out) {
+    int64_t nconn = 0;
+    for (Conn *c : g_data.fd2conn) if (c) nconn++;
+    out_arr(out, 4);
+    out_str(out, "keys", 4);
+    out_int(out, (int64_t)hm_size(&g_data.db));
+    out_str(out, "connections", 11);
+    out_int(out, nconn);
+}
+
+// OBJECT key
+static void do_object(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) return out_nil(out);
+    Entry *ent = container_of(node, Entry, node);
+
+    const char *tn = "unknown";
+    switch (ent->type) {
+        case T_STR:  tn = "string"; break;
+        case T_ZSET: tn = "zset";   break;
+        case T_LIST: tn = "list";   break;
+        case T_HASH: tn = "hash";   break;
+    }
+    out_arr(out, 4);
+    out_str(out, "type", 4);
+    out_str(out, tn, strlen(tn));
+    out_str(out, "ttl", 3);
+    out_int(out, ent->heap_idx != (size_t)-1 ? (int64_t)g_data.heap[ent->heap_idx].val : -1);
+}
+static void response_end(Buffer &out, size_t header);
 static void response_begin(Buffer &out, size_t *header);
 static void response_end(Buffer &out, size_t header);
 static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out);
@@ -1034,7 +1169,8 @@ static void aof_append(const uint8_t *data, size_t len) {
 
 static bool is_write_cmd(const std::string &c) {
     return c == "set" || c == "del" || c == "pexpire" || c == "zadd" || c == "zrem"
-        || c == "lpush" || c == "hset" || c == "hdel" || c == "setbit";
+        || c == "lpush" || c == "hset" || c == "hdel" || c == "setbit"
+        || c == "rename";
 }
 
 static bool cb_save(HNode *node, void *arg) {
@@ -1313,6 +1449,20 @@ static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
         return do_getbit(cmd, out);
     } else if (cmd.size() >= 2 && cmd.size() <= 4 && cmd[0] == "bitcount") {
         return do_bitcount(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "exists") {
+        return do_exists(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "type") {
+        return do_type(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "strlen") {
+        return do_strlen(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "rename") {
+        return do_rename(cmd, out);
+    } else if (cmd.size() >= 2 && cmd.size() <= 4 && cmd[0] == "scan") {
+        return do_scan(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "debug") {
+        return do_debug(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "object") {
+        return do_object(cmd, out);
     } else if (cmd[0] == "subscribe") {
         if (cmd.size() < 2) {
             return out_err(out, ERR_BAD_ARG, "wrong number of arguments for subscribe");

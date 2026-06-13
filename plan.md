@@ -18,9 +18,9 @@
 
 ## Commands (easy additions)
 
-- `EXISTS`, `TYPE`, `STRLEN`, `RENAME`
-- `SCAN` — cursor-based key iteration (avoids blocking for large key sets)
-- `DEBUG` / `OBJECT` — inspect internal data structures
+- ~~`EXISTS`, `TYPE`, `STRLEN`, `RENAME`~~ **done**
+- ~~`SCAN` — cursor-based key iteration (avoids blocking for large key sets)~~ **done**
+- ~~`DEBUG` / `OBJECT` — inspect internal data structures~~ **done**
 
 ## Operational
 

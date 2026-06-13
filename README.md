@@ -78,6 +78,13 @@ All arguments are strings. Numbers are parsed from strings.
 | `setbit` | `key` `offset` `value` | Set bit at offset to 0 or 1. Returns old bit |
 | `getbit` | `key` `offset` | Get bit at offset |
 | `bitcount` | `key` `[start end]` | Count set bits in byte range |
+| `exists` | `key` | Return 1 if key exists, 0 otherwise |
+| `type` | `key` | Return type name: `string`, `zset`, `list`, `hash`, or `none` |
+| `strlen` | `key` | Return length of string value |
+| `rename` | `key` `newkey` | Rename a key. Overwrites newkey if exists |
+| `scan` | `cursor` `[COUNT n]` | Incremental key iteration. Returns `[next_cursor, keys...]` |
+| `debug` | *(none)* | Return server info (key count, connections) |
+| `object` | `key` | Return metadata about a key (type, TTL) |
 | `subscribe` | `channel [channel ...]` | Subscribe to channels. Puts connection into pub/sub mode |
 | `unsubscribe` | `[channel ...]` | Unsubscribe from channels. Each channel returns `["unsubscribe", channel, count]`. If no channels given, unsubscribes from all |
 | `publish` | `channel` `message` | Send a message to all subscribers of a channel. Returns the number of subscribers that received it |
