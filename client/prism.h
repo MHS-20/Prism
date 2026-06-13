@@ -55,6 +55,21 @@ PrismReply *prism_unsubscribe(PrismConn *conn, const char *channel);
 PrismReply *prism_publish(PrismConn *conn, const char *channel, const char *message);
 PrismReply *prism_read_next(PrismConn *conn);
 
+// ---- pipelining (send without waiting) ----
+int prism_sendv(PrismConn *conn, const char **args, int nargs);
+int prism_send(PrismConn *conn, int nargs, ...);
+
+// ---- connection pool with auto-reconnect ----
+typedef struct PrismPool PrismPool;
+PrismPool *prism_pool_new(const char *host, uint16_t port, int size);
+void prism_pool_free(PrismPool *pool);
+PrismConn *prism_pool_get(PrismPool *pool);
+void prism_pool_release(PrismPool *pool, PrismConn *conn);
+
+// ---- non-blocking helpers ----
+int prism_set_nonblock(PrismConn *conn, int nonblock);
+int prism_fd(PrismConn *conn);
+
 #ifdef __cplusplus
 }
 #endif

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -445,13 +446,11 @@ PrismReply *prism_read_next(PrismConn *conn) {
     uint32_t resp_len = 0;
     memcpy(&resp_len, rbuf, 4);
     if (resp_len > k_max_msg) return NULL;
-
     uint8_t *resp = (uint8_t *)malloc(resp_len);
     if (!recv_all(conn->fd, resp, resp_len)) {
         free(resp);
         return NULL;
     }
-
     PrismReply *reply = (PrismReply *)calloc(1, sizeof(PrismReply));
     int ok = parse_reply_body(resp, resp_len, reply) ? 1 : 0;
     free(resp);
@@ -460,4 +459,121 @@ PrismReply *prism_read_next(PrismConn *conn) {
         return NULL;
     }
     return reply;
+}
+
+// ---- pipelining ----
+
+int prism_sendv(PrismConn *conn, const char **args, int nargs) {
+    if (nargs < 0 || (size_t)nargs > k_max_args) return -1;
+    size_t body_len = 4;
+    for (int i = 0; i < nargs; i++) {
+        body_len += 4 + strlen(args[i]);
+    }
+    if (body_len > k_max_msg) return -1;
+
+    uint8_t *body = (uint8_t *)malloc(body_len);
+    uint8_t *p = body;
+    buf_put_u32(&p, (uint32_t)nargs);
+    for (int i = 0; i < nargs; i++) {
+        size_t slen = strlen(args[i]);
+        buf_put_u32(&p, (uint32_t)slen);
+        buf_put_data(&p, args[i], slen);
+    }
+
+    uint32_t net_len = (uint32_t)body_len;
+    int ok = send_all(conn->fd, (const uint8_t *)&net_len, 4)
+          && send_all(conn->fd, body, body_len);
+    free(body);
+    return ok ? 0 : -1;
+}
+
+int prism_send(PrismConn *conn, int nargs, ...) {
+    va_list ap;
+    va_start(ap, nargs);
+    const char **args = (const char **)malloc(sizeof(char *) * (size_t)nargs);
+    for (int i = 0; i < nargs; i++) {
+        args[i] = va_arg(ap, const char *);
+    }
+    va_end(ap);
+    int r = prism_sendv(conn, args, nargs);
+    free(args);
+    return r;
+}
+
+// ---- connection pool ----
+
+struct PrismPool {
+    char host[256];
+    uint16_t port;
+    int size;
+    PrismConn **conns;
+    int *available;
+};
+
+PrismPool *prism_pool_new(const char *host, uint16_t port, int size) {
+    PrismPool *pool = (PrismPool *)calloc(1, sizeof(PrismPool));
+    strncpy(pool->host, host, sizeof(pool->host) - 1);
+    pool->host[sizeof(pool->host) - 1] = 0;
+    pool->port = port;
+    pool->size = size;
+    pool->conns = (PrismConn **)calloc((size_t)size, sizeof(PrismConn *));
+    pool->available = (int *)calloc((size_t)size, sizeof(int));
+    for (int i = 0; i < size; i++) {
+        pool->available[i] = 1;
+    }
+    return pool;
+}
+
+void prism_pool_free(PrismPool *pool) {
+    for (int i = 0; i < pool->size; i++) {
+        if (pool->conns[i]) prism_close(pool->conns[i]);
+    }
+    free(pool->conns);
+    free(pool->available);
+    free(pool);
+}
+
+PrismConn *prism_pool_get(PrismPool *pool) {
+    for (int i = 0; i < pool->size; i++) {
+        if (pool->available[i]) {
+            pool->available[i] = 0;
+            if (!pool->conns[i]) {
+                pool->conns[i] = prism_connect(pool->host, pool->port);
+            } else {
+                // quick health check: write 0 bytes to test fd
+                if (write(pool->conns[i]->fd, NULL, 0) < 0 && errno != EBADF) {
+                    prism_close(pool->conns[i]);
+                    pool->conns[i] = prism_connect(pool->host, pool->port);
+                }
+            }
+            return pool->conns[i];
+        }
+    }
+    return NULL;
+}
+
+void prism_pool_release(PrismPool *pool, PrismConn *conn) {
+    for (int i = 0; i < pool->size; i++) {
+        if (pool->conns[i] == conn) {
+            pool->available[i] = 1;
+            return;
+        }
+    }
+}
+
+// ---- non-blocking helpers ----
+
+int prism_set_nonblock(PrismConn *conn, int nonblock) {
+    int flags = fcntl(conn->fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (nonblock) {
+        flags |= O_NONBLOCK;
+    } else {
+        flags &= ~O_NONBLOCK;
+    }
+    return fcntl(conn->fd, F_SETFL, flags);
+}
+
+int prism_fd(PrismConn *conn) {
+    return conn->fd;
 }
