@@ -9,6 +9,9 @@
 struct Work {
     void (*f)(void *) = NULL;
     void *arg = NULL;
+
+    Work() = default;
+    Work(void (*fn)(void *), void *a) : f(fn), arg(a) {}
 };
 
 struct TheadPool {
