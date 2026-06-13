@@ -6,6 +6,11 @@ A minimal key-value Cache and Data Structure Server.
 <img src="prism.png" alt="Storage Logo" width="250">
 </div>
 
+## Persistence
+
+- **Append-only file (AOF)** — every write command (`set`, `del`, `pexpire`, `zadd`, `zrem`) is logged to `prism.aof`. On restart, the file is replayed to restore state.
+- **Snapshot (RDB)** — `save` dumps all keys to `prism.rdb` synchronously. `bgsave` forks a child process to do the dump in the background.
+
 ## Features
 
 - String key-value storage (`get`, `set`, `del`)
@@ -62,9 +67,22 @@ All arguments are strings. Numbers are parsed from strings.
 | `zrem` | `zset` `name` | Remove member. Returns 1 if existed |
 | `zscore` | `zset` `name` | Return score of member, or nil |
 | `zquery` | `zset` `score` `name` `offset` `limit` | Query members >= `(score, name)` with pagination. Returns flat array of `[name, score, name, score, ...]` |
-| `subscribe` | `channel [channel ...]` | Subscribe to channels. Puts connection into pub/sub mode (regular commands rejected). Each channel returns `["subscribe", channel, count]` |
+| `lpush` | `key` `val [val ...]` | Push values to head of list. Returns new length |
+| `lpop` | `key` | Pop value from head of list. Returns nil if empty |
+| `llen` | `key` | Return list length |
+| `lrange` | `key` `start` `stop` | Return range of list elements (inclusive indices) |
+| `hset` | `key` `field` `val` | Set hash field to value. Returns 1 if new field, 0 if updated |
+| `hget` | `key` `field` | Get hash field value. Returns nil if missing |
+| `hdel` | `key` `field` | Delete hash field. Returns 1 if existed |
+| `hgetall` | `key` | Return flat array of `[field, val, field, val, ...]` |
+| `setbit` | `key` `offset` `value` | Set bit at offset to 0 or 1. Returns old bit |
+| `getbit` | `key` `offset` | Get bit at offset |
+| `bitcount` | `key` `[start end]` | Count set bits in byte range |
+| `subscribe` | `channel [channel ...]` | Subscribe to channels. Puts connection into pub/sub mode |
 | `unsubscribe` | `[channel ...]` | Unsubscribe from channels. Each channel returns `["unsubscribe", channel, count]`. If no channels given, unsubscribes from all |
 | `publish` | `channel` `message` | Send a message to all subscribers of a channel. Returns the number of subscribers that received it |
+| `save` | *(none)* | Synchronously dump snapshot to `prism.rdb` |
+| `bgsave` | *(none)* | Fork a child to dump snapshot to `prism.rdb` in background. Returns child PID |
 
 ## Architecture
 

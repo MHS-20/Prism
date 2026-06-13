@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -205,6 +206,173 @@ static void test_zset(PrismConn *c) {
     prism_reply_free(r);
 }
 
+static void test_list(PrismConn *c) {
+    PrismReply *r;
+
+    r = prism_cmd(c, 2, "llen", "mylist");
+    if (!r) { CHECK(0, "llen reply"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 0, "llen empty list");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "lpush", "mylist", "a");
+    if (!r) { CHECK(0, "lpush reply"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 1, "lpush returns 1");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "lpush", "mylist", "b");
+    if (!r) { CHECK(0, "lpush reply"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 2, "lpush returns 2");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 4, "lpush", "mylist", "c", "d");
+    if (!r) { CHECK(0, "lpush multi"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 4, "lpush multi returns 4");
+    prism_reply_free(r);
+
+    // list should be: d c b a (head to tail)
+    r = prism_cmd(c, 4, "lrange", "mylist", "0", "-1");
+    if (!r) { CHECK(0, "lrange reply"); return; }
+    CHECK(prism_type(r) == PRISM_ARR && prism_arr_len(r) == 4, "lrange all returns 4");
+    if (prism_arr_len(r) >= 4) {
+        const char *s0 = prism_str(prism_arr_at(r, 0), NULL);
+        const char *s1 = prism_str(prism_arr_at(r, 1), NULL);
+        const char *s2 = prism_str(prism_arr_at(r, 2), NULL);
+        const char *s3 = prism_str(prism_arr_at(r, 3), NULL);
+        CHECK(s0 && strcmp(s0, "d") == 0, "lrange[0]=d");
+        CHECK(s1 && strcmp(s1, "c") == 0, "lrange[1]=c");
+        CHECK(s2 && strcmp(s2, "b") == 0, "lrange[2]=b");
+        CHECK(s3 && strcmp(s3, "a") == 0, "lrange[3]=a");
+    }
+    prism_reply_free(r);
+
+    // lrange partial
+    r = prism_cmd(c, 4, "lrange", "mylist", "1", "2");
+    if (!r) { CHECK(0, "lrange partial"); return; }
+    CHECK(prism_arr_len(r) == 2, "lrange 1-2 returns 2");
+    const char *s1 = prism_str(prism_arr_at(r, 0), NULL);
+    const char *s2 = prism_str(prism_arr_at(r, 1), NULL);
+    CHECK(s1 && strcmp(s1, "c") == 0, "lrange[1]=c");
+    CHECK(s2 && strcmp(s2, "b") == 0, "lrange[2]=b");
+    prism_reply_free(r);
+
+    // lpop
+    r = prism_cmd(c, 2, "lpop", "mylist");
+    if (!r) { CHECK(0, "lpop reply"); return; }
+    CHECK(prism_type(r) == PRISM_STR, "lpop returns str");
+    const char *popped = prism_str(r, NULL);
+    CHECK(popped && strcmp(popped, "d") == 0, "lpop returns d");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "llen", "mylist");
+    CHECK(prism_int(r) == 3, "llen after pop is 3");
+    prism_reply_free(r);
+
+    // pop empty
+    r = prism_cmd(c, 2, "lpop", "nonexist");
+    CHECK(prism_type(r) == PRISM_NIL, "lpop non-existent returns nil");
+    prism_reply_free(r);
+}
+
+static void test_hash(PrismConn *c) {
+    PrismReply *r;
+
+    r = prism_cmd(c, 4, "hset", "myhash", "name", "alice");
+    if (!r) { CHECK(0, "hset reply"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 1, "hset new returns 1");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 4, "hset", "myhash", "age", "30");
+    if (!r) { CHECK(0, "hset reply"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 1, "hset second returns 1");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 4, "hset", "myhash", "name", "bob");
+    if (!r) { CHECK(0, "hset update"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 0, "hset update returns 0");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "hget", "myhash", "name");
+    if (!r) { CHECK(0, "hget reply"); return; }
+    CHECK(prism_type(r) == PRISM_STR, "hget returns str");
+    const char *name = prism_str(r, NULL);
+    CHECK(name && strcmp(name, "bob") == 0, "hget name is bob");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "hget", "myhash", "nonexist");
+    CHECK(prism_type(r) == PRISM_NIL, "hget non-existent returns nil");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "hdel", "myhash", "age");
+    if (!r) { CHECK(0, "hdel reply"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 1, "hdel existing returns 1");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "hdel", "myhash", "age");
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 0, "hdel non-existent returns 0");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "hgetall", "myhash");
+    if (!r) { CHECK(0, "hgetall reply"); return; }
+    CHECK(prism_type(r) == PRISM_ARR && prism_arr_len(r) == 2, "hgetall returns 2 values");
+    if (prism_arr_len(r) >= 2) {
+        const char *f = prism_str(prism_arr_at(r, 0), NULL);
+        const char *v = prism_str(prism_arr_at(r, 1), NULL);
+        CHECK(f && strcmp(f, "name") == 0, "hgetall field is name");
+        CHECK(v && strcmp(v, "bob") == 0, "hgetall val is bob");
+    }
+    prism_reply_free(r);
+}
+
+static void test_bitmap(PrismConn *c) {
+    PrismReply *r;
+
+    // getbit of non-existent
+    r = prism_cmd(c, 3, "getbit", "mybits", "0");
+    CHECK(prism_int(r) == 0, "getbit non-existent returns 0");
+    prism_reply_free(r);
+
+    // setbit
+    r = prism_cmd(c, 4, "setbit", "mybits", "7", "1");
+    if (!r) { CHECK(0, "setbit reply"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) == 0, "setbit new returns old 0");
+    prism_reply_free(r);
+
+    // getbit
+    r = prism_cmd(c, 3, "getbit", "mybits", "7");
+    CHECK(prism_int(r) == 1, "getbit returns 1");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "getbit", "mybits", "0");
+    CHECK(prism_int(r) == 0, "getbit other bit returns 0");
+    prism_reply_free(r);
+
+    // setbit back to 0
+    r = prism_cmd(c, 4, "setbit", "mybits", "7", "0");
+    CHECK(prism_int(r) == 1, "setbit existing returns old 1");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "getbit", "mybits", "7");
+    CHECK(prism_int(r) == 0, "getbit after clear returns 0");
+    prism_reply_free(r);
+
+    // set multiple bits and check bitcount
+    r = prism_cmd(c, 4, "setbit", "mybits", "0", "1");
+    prism_reply_free(r);
+    r = prism_cmd(c, 4, "setbit", "mybits", "1", "1");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 2, "bitcount", "mybits");
+    if (!r) { CHECK(0, "bitcount reply"); return; }
+    CHECK(prism_int(r) == 2, "bitcount returns 2");
+    prism_reply_free(r);
+
+    // bitcount with range
+    r = prism_cmd(c, 3, "bitcount", "mybits", "0");
+    if (!r) { CHECK(0, "bitcount range"); return; }
+    CHECK(prism_int(r) == 2, "bitcount byte 0 returns 2");
+    prism_reply_free(r);
+}
+
 static void test_pubsub(PrismConn *c) {
     PrismConn *sub = prism_connect("127.0.0.1", 1234);
     if (!sub) { CHECK(0, "sub connect"); return; }
@@ -292,6 +460,50 @@ cleanup:
     prism_close(sub);
 }
 
+static void test_persistence(PrismConn *c) {
+    PrismReply *r;
+
+    r = prism_set(c, "pk", "pv");
+    prism_reply_free(r);
+
+    // SAVE
+    r = prism_cmd(c, 1, "save");
+    if (!r) { CHECK(0, "save reply non-null"); return; }
+    CHECK(prism_type(r) == PRISM_NIL, "save returns nil");
+    prism_reply_free(r);
+
+    // check file
+    FILE *f = fopen("prism.rdb", "r");
+    CHECK(f != NULL, "prism.rdb exists after save");
+    if (f) fclose(f);
+
+    // data still readable
+    r = prism_get(c, "pk");
+    if (!r) { CHECK(0, "get after save"); return; }
+    CHECK(prism_type(r) == PRISM_STR, "key alive after save");
+    prism_reply_free(r);
+
+    // BGSAVE
+    r = prism_cmd(c, 1, "bgsave");
+    if (!r) { CHECK(0, "bgsave reply"); return; }
+    CHECK(prism_type(r) == PRISM_INT && prism_int(r) > 0, "bgsave returns pid");
+    prism_reply_free(r);
+
+    // server still works after bgsave fork
+    r = prism_get(c, "pk");
+    if (!r) { CHECK(0, "get after bgsave"); return; }
+    CHECK(prism_type(r) == PRISM_STR, "key alive after bgsave");
+    prism_reply_free(r);
+
+    // AOF file exists after writes
+    f = fopen("prism.aof", "r");
+    CHECK(f != NULL, "prism.aof exists after writes");
+    if (f) fclose(f);
+
+    remove("prism.rdb");
+    remove("prism.aof");
+}
+
 int main(int argc, char **argv) {
     const char *server_path = "./build/prism-server";
     if (argc > 1) {
@@ -311,6 +523,10 @@ int main(int argc, char **argv) {
         perror("fork");
         return 1;
     }
+
+    // clean up persistence files from previous runs
+    remove("prism.aof");
+    remove("prism.rdb");
 
     fprintf(stderr, "--- prism test ---\n");
     fprintf(stderr, "server PID %d, waiting for startup...\n", (int)pid);
@@ -336,7 +552,11 @@ int main(int argc, char **argv) {
     test_ttl(c);
     test_keys(c);
     test_zset(c);
+    test_list(c);
+    test_hash(c);
+    test_bitmap(c);
     test_pubsub(c);
+    test_persistence(c);
 
     prism_close(c);
 

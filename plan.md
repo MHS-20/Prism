@@ -7,14 +7,14 @@
 
 ## Persistence
 
-- **Append-only file (AOF)** — log every write command to a file, replay on restart. Straightforward, high pedagogical value
-- **Snapshot (RDB-style)** — periodic `fork()` + dump entire dataset to disk
+- ~~**Append-only file (AOF)** — log every write command to a file, replay on restart~~ **done**
+- ~~**Snapshot (RDB-style)** — periodic `fork()` + dump entire dataset to disk~~ **done**
 
 ## Data structures
 
-- **List** (linked list or ziplist) with `LPUSH`, `LPOP`, `LRANGE`, `LLEN`
-- **Hash** — the `HMap` already exists; just wire `HSET`, `HGET`, `HDEL`, `HGETALL` commands
-- **Bitmap** — `SETBIT`, `GETBIT`, `BITCOUNT`
+- ~~**List** (linked list or ziplist) with `LPUSH`, `LPOP`, `LRANGE`, `LLEN`~~ **done**
+- ~~**Hash** — the `HMap` already exists; just wire `HSET`, `HGET`, `HDEL`, `HGETALL` commands~~ **done**
+- ~~**Bitmap** — `SETBIT`, `GETBIT`, `BITCOUNT`~~ **done**
 
 ## Commands (easy additions)
 

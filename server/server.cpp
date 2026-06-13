@@ -26,6 +26,8 @@
 #include "list.h"
 #include "heap.h"
 #include "thread_pool.h"
+#include "list_type.h"
+#include "hash_type.h"
 
 
 static void msg(const char *msg) {
@@ -291,6 +293,8 @@ enum {
     T_INIT  = 0,
     T_STR   = 1,    // string
     T_ZSET  = 2,    // sorted set
+    T_LIST  = 3,    // linked list
+    T_HASH  = 4,    // hash map
 };
 
 // KV pair for the top-level hashtable
@@ -304,6 +308,8 @@ struct Entry {
     // one of the following
     std::string str;
     ZSet zset;
+    LList list;
+    HMap hash_map;
 };
 
 static Entry *entry_new(uint32_t type) {
@@ -317,6 +323,10 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
 static void entry_del_sync(Entry *ent) {
     if (ent->type == T_ZSET) {
         zset_clear(&ent->zset);
+    } else if (ent->type == T_LIST) {
+        llist_clear(&ent->list);
+    } else if (ent->type == T_HASH) {
+        hm_clear(&ent->hash_map);
     }
     delete ent;
 }
@@ -329,9 +339,16 @@ static void entry_del(Entry *ent) {
     // unlink it from any data structures
     entry_set_ttl(ent, -1); // remove from the heap data structure
     // run the destructor in a thread pool for large data structures
-    size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+    size_t container_size = 0;
+    if (ent->type == T_ZSET) {
+        container_size = hm_size(&ent->zset.hmap);
+    } else if (ent->type == T_LIST) {
+        container_size = ent->list.len;
+    } else if (ent->type == T_HASH) {
+        container_size = hm_size(&ent->hash_map);
+    }
     const size_t k_large_container_size = 1000;
-    if (set_size > k_large_container_size) {
+    if (container_size > k_large_container_size) {
         thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
     } else {
         entry_del_sync(ent);    // small; avoid context switches
@@ -615,8 +632,295 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
     out_end_arr(out, ctx, (uint32_t)n);
 }
 
+// ---- list commands ----
+
+// lpush key val [val ...]
+static void do_lpush(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = entry_new(T_LIST);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_LIST) {
+            return out_err(out, ERR_BAD_TYP, "not a list");
+        }
+    }
+    for (size_t i = 2; i < cmd.size(); i++) {
+        llist_push(&ent->list, cmd[i]);
+    }
+    out_int(out, (int64_t)ent->list.len);
+}
+
+// lpop key
+static void do_lpop(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return out_nil(out);
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_LIST) return out_err(out, ERR_BAD_TYP, "not a list");
+
+    std::string val;
+    if (llist_pop(&ent->list, val)) {
+        out_str(out, val.data(), val.size());
+    } else {
+        out_nil(out);
+    }
+}
+
+// llen key
+static void do_llen(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return out_int(out, 0);
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_LIST) return out_err(out, ERR_BAD_TYP, "not a list");
+    out_int(out, (int64_t)ent->list.len);
+}
+
+// lrange key start stop
+static void do_lrange(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return out_arr(out, 0);
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_LIST) return out_err(out, ERR_BAD_TYP, "not a list");
+
+    int64_t start = 0, stop = 0;
+    if (!str2int(cmd[2], start) || !str2int(cmd[3], stop)) {
+        return out_err(out, ERR_BAD_ARG, "expect int");
+    }
+
+    // convert negative indices
+    if (start < 0) start = (int64_t)ent->list.len + start;
+    if (stop < 0) stop = (int64_t)ent->list.len + stop;
+    if (start < 0) start = 0;
+    if (stop < 0 || (size_t)start >= ent->list.len) return out_arr(out, 0);
+    if ((size_t)stop >= ent->list.len) stop = (int64_t)ent->list.len - 1;
+
+    size_t n = (size_t)(stop - start + 1);
+    out_arr(out, (uint32_t)n);
+    LNode *cur = llist_index(&ent->list, start);
+    for (size_t i = 0; cur && i < n; i++) {
+        out_str(out, cur->val.data(), cur->val.size());
+        cur = cur->next;
+    }
+}
+
+// ---- hash commands ----
+
+// hset key field val
+static void do_hset(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = entry_new(T_HASH);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_HASH) return out_err(out, ERR_BAD_TYP, "not a hash");
+    }
+
+    // lookup field
+    HLookup hkey;
+    hkey.field = cmd[2];
+    hkey.node.hcode = str_hash((uint8_t *)hkey.field.data(), hkey.field.size());
+    HNode *fnode = hm_lookup(&ent->hash_map, &hkey.node, &hentry_eq);
+    if (fnode) {
+        HEntry *he = container_of(fnode, HEntry, node);
+        he->val = cmd[3];
+        out_int(out, 0);
+    } else {
+        HEntry *he = new HEntry();
+        he->field = cmd[2];
+        he->val = cmd[3];
+        he->node.hcode = hkey.node.hcode;
+        hm_insert(&ent->hash_map, &he->node);
+        out_int(out, 1);
+    }
+}
+
+// hget key field
+static void do_hget(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return out_nil(out);
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_HASH) return out_err(out, ERR_BAD_TYP, "not a hash");
+
+    HLookup hkey;
+    hkey.field = cmd[2];
+    hkey.node.hcode = str_hash((uint8_t *)hkey.field.data(), hkey.field.size());
+    HNode *fnode = hm_lookup(&ent->hash_map, &hkey.node, &hentry_eq);
+    if (!fnode) return out_nil(out);
+    HEntry *he = container_of(fnode, HEntry, node);
+    out_str(out, he->val.data(), he->val.size());
+}
+
+// hdel key field
+static void do_hdel(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return out_int(out, 0);
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_HASH) return out_err(out, ERR_BAD_TYP, "not a hash");
+
+    HLookup hkey;
+    hkey.field = cmd[2];
+    hkey.node.hcode = str_hash((uint8_t *)hkey.field.data(), hkey.field.size());
+    HNode *fnode = hm_delete(&ent->hash_map, &hkey.node, &hentry_eq);
+    if (!fnode) return out_int(out, 0);
+    HEntry *he = container_of(fnode, HEntry, node);
+    delete he;
+    out_int(out, 1);
+}
+
+// hgetall key
+static void do_hgetall(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return out_arr(out, 0);
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_HASH) return out_err(out, ERR_BAD_TYP, "not a hash");
+
+    struct HGetAllCtx { Buffer *out; };
+    HGetAllCtx ctx = { &out };
+    out_arr(out, (uint32_t)(hm_size(&ent->hash_map) * 2));
+    hm_foreach(&ent->hash_map, [](HNode *node, void *arg) -> bool {
+        HEntry *he = container_of(node, HEntry, node);
+        Buffer *obuf = ((HGetAllCtx *)arg)->out;
+        out_str(*obuf, he->field.data(), he->field.size());
+        out_str(*obuf, he->val.data(), he->val.size());
+        return true;
+    }, &ctx);
+}
+
+// ---- bitmap commands ----
+
+// setbit key offset value
+static void do_setbit(std::vector<std::string> &cmd, Buffer &out) {
+    int64_t offset = 0, bit = 0;
+    if (!str2int(cmd[2], offset) || !str2int(cmd[3], bit) || offset < 0 || (bit != 0 && bit != 1)) {
+        return out_err(out, ERR_BAD_ARG, "expect uint offset and 0/1");
+    }
+
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = entry_new(T_STR);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string");
+    }
+
+    size_t byte_pos = (size_t)(offset / 8);
+    int bit_off = (int)(offset % 8);
+    if (byte_pos >= ent->str.size()) {
+        ent->str.resize(byte_pos + 1, 0);
+    }
+    uint8_t old_bit = (ent->str[byte_pos] >> bit_off) & 1;
+    if (bit) {
+        ent->str[byte_pos] |= (uint8_t)(1 << bit_off);
+    } else {
+        ent->str[byte_pos] &= (uint8_t)~(1 << bit_off);
+    }
+    out_int(out, (int64_t)old_bit);
+}
+
+// getbit key offset
+static void do_getbit(std::vector<std::string> &cmd, Buffer &out) {
+    int64_t offset = 0;
+    if (!str2int(cmd[2], offset) || offset < 0) {
+        return out_err(out, ERR_BAD_ARG, "expect uint offset");
+    }
+
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return out_int(out, 0);
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string");
+
+    size_t byte_pos = (size_t)(offset / 8);
+    int bit_off = (int)(offset % 8);
+    if (byte_pos >= ent->str.size()) return out_int(out, 0);
+    int64_t b = (ent->str[byte_pos] >> bit_off) & 1;
+    out_int(out, b);
+}
+
+// bitcount key [start end]
+static void do_bitcount(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) return out_int(out, 0);
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_STR) return out_err(out, ERR_BAD_TYP, "not a string");
+
+    size_t start = 0;
+    size_t end = ent->str.size();
+    if (cmd.size() >= 3) {
+        int64_t s = 0;
+        if (!str2int(cmd[2], s)) return out_err(out, ERR_BAD_ARG, "expect int");
+        if (s < 0) s = (int64_t)ent->str.size() + s;
+        if (s < 0) s = 0;
+        start = (size_t)s;
+    }
+    if (cmd.size() >= 4) {
+        int64_t e = 0;
+        if (!str2int(cmd[3], e)) return out_err(out, ERR_BAD_ARG, "expect int");
+        if (e < 0) e = (int64_t)ent->str.size() + e;
+        if (e < 0) { out_int(out, 0); return; }
+        end = (size_t)e + 1;
+    }
+
+    if (start > ent->str.size()) start = ent->str.size();
+    if (end > ent->str.size()) end = ent->str.size();
+
+    int64_t count = 0;
+    for (size_t i = start; i < end; i++) {
+        uint8_t b = ent->str[i];
+        // popcount
+        while (b) { count += b & 1; b >>= 1; }
+    }
+    out_int(out, count);
+}
+
 static void response_begin(Buffer &out, size_t *header);
 static void response_end(Buffer &out, size_t header);
+static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out);
+static bool hnode_same(HNode *node, HNode *key);
 
 // subscribe channel [channel ...]
 static void do_subscribe(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
@@ -711,8 +1015,259 @@ static void do_publish(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
     out_int(out, count);
 }
 
+// ---- persistence ----
+
+static FILE *aof_file = NULL;
+
+static void aof_init() {
+    aof_file = fopen("prism.aof", "a");
+    if (!aof_file) {
+        fprintf(stderr, "warn: no prism.aof, persistence off\n");
+    }
+}
+
+static void aof_append(const uint8_t *data, size_t len) {
+    if (!aof_file) return;
+    fwrite(data, 1, len, aof_file);
+    fflush(aof_file);
+}
+
+static bool is_write_cmd(const std::string &c) {
+    return c == "set" || c == "del" || c == "pexpire" || c == "zadd" || c == "zrem"
+        || c == "lpush" || c == "hset" || c == "hdel" || c == "setbit";
+}
+
+static bool cb_save(HNode *node, void *arg) {
+    FILE *f = (FILE *)arg;
+    Entry *ent = container_of(node, Entry, node);
+
+    uint32_t klen = (uint32_t)ent->key.size();
+    fwrite(&klen, 4, 1, f);
+    fwrite(ent->key.data(), 1, klen, f);
+
+    uint8_t typ = (uint8_t)ent->type;
+    fwrite(&typ, 1, 1, f);
+
+    uint64_t expire = 0;
+    if (ent->heap_idx != (size_t)-1) {
+        expire = g_data.heap[ent->heap_idx].val;
+    }
+    fwrite(&expire, 8, 1, f);
+
+    if (ent->type == T_STR) {
+        uint32_t vlen = (uint32_t)ent->str.size();
+        fwrite(&vlen, 4, 1, f);
+        fwrite(ent->str.data(), 1, vlen, f);
+    } else if (ent->type == T_ZSET) {
+        uint32_t n = (uint32_t)hm_size(&ent->zset.hmap);
+        fwrite(&n, 4, 1, f);
+        struct ZsaveCtx { FILE *f; };
+        ZsaveCtx zctx = { f };
+        hm_foreach(&ent->zset.hmap, [](HNode *znode, void *arg) -> bool {
+            ZNode *z = container_of(znode, ZNode, hmap);
+            FILE *fp = ((ZsaveCtx *)arg)->f;
+            double score = z->score;
+            uint32_t nlen = (uint32_t)z->len;
+            fwrite(&score, 8, 1, fp);
+            fwrite(&nlen, 4, 1, fp);
+            fwrite(z->name, 1, nlen, fp);
+            return true;
+        }, &zctx);
+    } else if (ent->type == T_LIST) {
+        uint32_t n = (uint32_t)ent->list.len;
+        fwrite(&n, 4, 1, f);
+        LNode *cur = ent->list.head;
+        while (cur) {
+            uint32_t vlen = (uint32_t)cur->val.size();
+            fwrite(&vlen, 4, 1, f);
+            fwrite(cur->val.data(), 1, vlen, f);
+            cur = cur->next;
+        }
+    } else if (ent->type == T_HASH) {
+        uint32_t n = (uint32_t)hm_size(&ent->hash_map);
+        fwrite(&n, 4, 1, f);
+        struct HsaveCtx { FILE *f; };
+        HsaveCtx hctx = { f };
+        hm_foreach(&ent->hash_map, [](HNode *hnode, void *arg) -> bool {
+            HEntry *he = container_of(hnode, HEntry, node);
+            FILE *fp = ((HsaveCtx *)arg)->f;
+            uint32_t flen = (uint32_t)he->field.size();
+            uint32_t vlen = (uint32_t)he->val.size();
+            fwrite(&flen, 4, 1, fp);
+            fwrite(he->field.data(), 1, flen, fp);
+            fwrite(&vlen, 4, 1, fp);
+            fwrite(he->val.data(), 1, vlen, fp);
+            return true;
+        }, &hctx);
+    }
+    return true;
+}
+
+static int save_snapshot(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+
+    uint64_t magic = 0x44424d535052494dULL; // "PRISMDB\n" reversed
+    // Actually just write the string
+    fprintf(f, "PRISMDB\n");
+
+    uint32_t count = (uint32_t)hm_size(&g_data.db);
+    fwrite(&count, 4, 1, f);
+
+    hm_foreach(&g_data.db, &cb_save, (void *)f);
+
+    fclose(f);
+    return 0;
+}
+
+static int load_snapshot(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    // check magic
+    uint8_t magic[8];
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "PRISMDB\n", 8) != 0) {
+        fclose(f);
+        return -1;
+    }
+
+    uint32_t count = 0;
+    if (fread(&count, 4, 1, f) != 1) { fclose(f); return -1; }
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t klen = 0;
+        if (fread(&klen, 4, 1, f) != 1) break;
+        std::string key((size_t)klen, '\0');
+        if (fread(&key[0], 1, klen, f) != klen) break;
+
+        uint8_t typ = 0;
+        if (fread(&typ, 1, 1, f) != 1) break;
+
+        uint64_t expire = 0;
+        if (fread(&expire, 8, 1, f) != 1) break;
+
+        Entry *ent = entry_new(typ);
+        ent->key = key;
+        ent->node.hcode = str_hash((uint8_t *)key.data(), key.size());
+
+        if (typ == T_STR) {
+            uint32_t vlen = 0;
+            if (fread(&vlen, 4, 1, f) != 1) break;
+            ent->str.resize(vlen);
+            if (fread(&ent->str[0], 1, vlen, f) != vlen) break;
+        } else if (typ == T_ZSET) {
+            uint32_t n = 0;
+            if (fread(&n, 4, 1, f) != 1) break;
+            for (uint32_t j = 0; j < n; j++) {
+                double score = 0;
+                if (fread(&score, 8, 1, f) != 1) break;
+                uint32_t nlen = 0;
+                if (fread(&nlen, 4, 1, f) != 1) break;
+                std::string name((size_t)nlen, '\0');
+                if (fread(&name[0], 1, nlen, f) != nlen) break;
+                zset_insert(&ent->zset, name.data(), name.size(), score);
+            }
+        } else if (typ == T_LIST) {
+            uint32_t n = 0;
+            if (fread(&n, 4, 1, f) != 1) break;
+            for (uint32_t j = 0; j < n; j++) {
+                uint32_t vlen = 0;
+                if (fread(&vlen, 4, 1, f) != 1) break;
+                std::string s((size_t)vlen, '\0');
+                if (fread(&s[0], 1, vlen, f) != vlen) break;
+                llist_push(&ent->list, s);
+            }
+        } else if (typ == T_HASH) {
+            uint32_t n = 0;
+            if (fread(&n, 4, 1, f) != 1) break;
+            for (uint32_t j = 0; j < n; j++) {
+                uint32_t flen = 0, vlen = 0;
+                if (fread(&flen, 4, 1, f) != 1) break;
+                std::string field((size_t)flen, '\0');
+                if (fread(&field[0], 1, flen, f) != flen) break;
+                if (fread(&vlen, 4, 1, f) != 1) break;
+                std::string val((size_t)vlen, '\0');
+                if (fread(&val[0], 1, vlen, f) != vlen) break;
+                HEntry *he = new HEntry();
+                he->field = field;
+                he->val = val;
+                he->node.hcode = str_hash((uint8_t *)field.data(), field.size());
+                hm_insert(&ent->hash_map, &he->node);
+            }
+        }
+
+        hm_insert(&g_data.db, &ent->node);
+
+        // restore TTL
+        if (expire > 0) {
+            uint64_t now = get_monotonic_msec();
+            if (expire > now) {
+                ent->heap_idx = g_data.heap.size();
+                HeapItem item = {expire, &ent->heap_idx};
+                g_data.heap.push_back(item);
+                heap_update(g_data.heap.data(), ent->heap_idx, g_data.heap.size());
+            } else {
+                // already expired, skip it? or delete it now
+                HNode *n = hm_delete(&g_data.db, &ent->node, &hnode_same);
+                if (n) entry_del(ent);
+            }
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static void aof_replay() {
+    FILE *f = fopen("prism.aof", "r");
+    if (!f) return;
+
+    uint8_t header[4];
+    Buffer dummy;
+    std::vector<std::string> cmd;
+
+    while (fread(header, 1, 4, f) == 4) {
+        uint32_t body_len = 0;
+        memcpy(&body_len, header, 4);
+        if (body_len > k_max_msg) break;
+
+        uint8_t *body = (uint8_t *)malloc(body_len);
+        if (!body) break;
+        if (fread(body, 1, body_len, f) != body_len) {
+            free(body);
+            break;
+        }
+
+        cmd.clear();
+        if (parse_req(body, body_len, cmd) == 0 && !cmd.empty()) {
+            do_request(cmd, NULL, dummy);
+        }
+        free(body);
+    }
+    fclose(f);
+    fprintf(stderr, "aof replay done\n");
+}
+
+static void do_save(std::vector<std::string> &, Buffer &out) {
+    if (save_snapshot("prism.rdb") == 0) {
+        out_nil(out);
+    } else {
+        out_err(out, ERR_UNKNOWN, "save failed");
+    }
+}
+
+static void do_bgsave(std::vector<std::string> &, Buffer &out) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        // child: save and exit
+        save_snapshot("prism.rdb");
+        _exit(0);
+    }
+    out_int(out, (int64_t)pid);
+}
+
 static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
-    if (conn->subscribed && cmd[0] != "subscribe" && cmd[0] != "unsubscribe") {
+    if (conn && conn->subscribed && cmd[0] != "subscribe" && cmd[0] != "unsubscribe") {
         return out_err(out, ERR_UNKNOWN, "only subscribe/unsubscribe allowed in pub/sub mode");
     }
 
@@ -736,6 +1291,28 @@ static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
         return do_zscore(cmd, out);
     } else if (cmd.size() == 6 && cmd[0] == "zquery") {
         return do_zquery(cmd, out);
+    } else if (cmd.size() >= 2 && cmd[0] == "lpush") {
+        return do_lpush(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "lpop") {
+        return do_lpop(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "llen") {
+        return do_llen(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "lrange") {
+        return do_lrange(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "hset") {
+        return do_hset(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "hget") {
+        return do_hget(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "hdel") {
+        return do_hdel(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "hgetall") {
+        return do_hgetall(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "setbit") {
+        return do_setbit(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "getbit") {
+        return do_getbit(cmd, out);
+    } else if (cmd.size() >= 2 && cmd.size() <= 4 && cmd[0] == "bitcount") {
+        return do_bitcount(cmd, out);
     } else if (cmd[0] == "subscribe") {
         if (cmd.size() < 2) {
             return out_err(out, ERR_BAD_ARG, "wrong number of arguments for subscribe");
@@ -745,6 +1322,10 @@ static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
         return do_unsubscribe(cmd, conn, out);
     } else if (cmd.size() == 3 && cmd[0] == "publish") {
         return do_publish(cmd, conn, out);
+    } else if (cmd.size() == 1 && cmd[0] == "save") {
+        return do_save(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "bgsave") {
+        return do_bgsave(cmd, out);
     } else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
@@ -799,6 +1380,11 @@ static bool try_one_request(Conn *conn) {
     response_begin(conn->outgoing, &header_pos);
     do_request(cmd, conn, conn->outgoing);
     response_end(conn->outgoing, header_pos);
+
+    // log write commands to append-only file
+    if (is_write_cmd(cmd[0])) {
+        aof_append(conn->incoming.data(), 4 + len);
+    }
 
     // application logic done! remove the request message.
     buf_consume(conn->incoming, 4 + len);
@@ -933,6 +1519,13 @@ int main() {
     // initialization
     dlist_init(&g_data.idle_list);
     thread_pool_init(&g_data.thread_pool, 4);
+
+    // load data from disk
+    if (load_snapshot("prism.rdb") == 0) {
+        fprintf(stderr, "loaded snapshot\n");
+    }
+    aof_init();
+    aof_replay();
 
     // the listening socket
     int fd = socket(AF_INET, SOCK_STREAM, 0);
