@@ -16,3 +16,8 @@ run: build
 
 test: build
 	@$(BUILD_DIR)/prism-test "$(BUILD_DIR)/prism-server"
+
+fuzz: build
+	@$(BUILD_DIR)/prism-fuzz "$(BUILD_DIR)/prism-server" 2000
+
+.PHONY: fuzz

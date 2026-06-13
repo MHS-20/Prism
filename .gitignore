@@ -1,4 +1,6 @@
 AGENTS.md
+prism.aof
+prism.db
 build/
 CMakeCache.txt
 CMakeFiles/

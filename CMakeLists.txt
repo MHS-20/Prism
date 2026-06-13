@@ -21,12 +21,17 @@ target_include_directories(prism-client PUBLIC client)
 # -- tests --
 enable_testing()
 
-file(GLOB PRISM_TEST_SOURCES test/*.cpp)
-
-add_executable(prism-test ${PRISM_TEST_SOURCES})
+add_executable(prism-test test/test_client.cpp)
 target_include_directories(prism-test PRIVATE client)
 target_link_libraries(prism-test PRIVATE prism-client)
 
+add_executable(prism-fuzz test/fuzz.cpp)
+target_link_libraries(prism-fuzz PRIVATE)
+
 add_test(NAME client-tests
     COMMAND prism-test "$<TARGET_FILE:prism-server>"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/..)
+
+add_test(NAME fuzz-test
+    COMMAND prism-fuzz "$<TARGET_FILE:prism-server>" 2000
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/..)
