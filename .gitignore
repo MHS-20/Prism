@@ -6,3 +6,6 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Testing/
+prism.aof.pre
+prism.rdb.tmp
+prism.rdb

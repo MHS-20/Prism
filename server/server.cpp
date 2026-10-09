@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
@@ -1069,13 +1070,36 @@ static void do_publish(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
 }
 
 // ---- persistence ----
+//
+// prism.rdb is a snapshot of the whole keyspace. prism.aof logs every write
+// made after that snapshot, so startup is "load the snapshot, replay the log".
+// The log must never hold writes the snapshot already contains: replaying a
+// non-idempotent command such as lpush twice would duplicate data.
+//
+// bgsave snapshots the state at fork time while the parent keeps writing, so
+// at the fork the current log moves to prism.aof.pre (the writes the child's
+// snapshot will contain) and a fresh log starts. prism.aof.pre is deleted only
+// once the child has succeeded; until then startup replays it before the log.
+
+static const char *k_rdb_path = "prism.rdb";
+static const char *k_aof_path = "prism.aof";
+static const char *k_aof_pre_path = "prism.aof.pre";
 
 static FILE *aof_file = NULL;
+static bool aof_dirty = false;          // written since the last fsync
+static uint64_t aof_last_sync_ms = 0;
+static pid_t bgsave_pid = -1;
 
-static void aof_init() {
-    aof_file = fopen("prism.aof", "a");
+static uint64_t get_wall_msec() {
+    struct timespec tv = {0, 0};
+    clock_gettime(CLOCK_REALTIME, &tv);
+    return uint64_t(tv.tv_sec) * 1000 + tv.tv_nsec / 1000 / 1000;
+}
+
+static void aof_open() {
+    aof_file = fopen(k_aof_path, "a");
     if (!aof_file) {
-        fprintf(stderr, "warn: no prism.aof, persistence off\n");
+        fprintf(stderr, "warn: cannot open %s, persistence off\n", k_aof_path);
     }
 }
 
@@ -1083,197 +1107,225 @@ static void aof_append(const uint8_t *data, size_t len) {
     if (!aof_file) return;
     fwrite(data, 1, len, aof_file);
     fflush(aof_file);
+    aof_dirty = true;
+}
+
+// fflush() only hands data to the kernel; fsync once a second bounds what a
+// power loss can take, without paying a disk flush per write
+static void aof_sync() {
+    uint64_t now_ms = get_monotonic_msec();
+    if (aof_file && aof_dirty && now_ms - aof_last_sync_ms >= 1000) {
+        fsync(fileno(aof_file));
+        aof_dirty = false;
+        aof_last_sync_ms = now_ms;
+    }
+}
+
+static void aof_append_cmd(const std::vector<std::string> &args) {
+    Buffer frame;
+    buf_append_u32(frame, 0);
+    buf_append_u32(frame, (uint32_t)args.size());
+    for (const std::string &a : args) {
+        buf_append_u32(frame, (uint32_t)a.size());
+        buf_append(frame, (const uint8_t *)a.data(), a.size());
+    }
+    uint32_t len = (uint32_t)(frame.size() - 4);
+    memcpy(&frame[0], &len, 4);
+    aof_append(frame.data(), frame.size());
 }
 
 static bool is_write_cmd(const std::string &c) {
-    return c == "set" || c == "del" || c == "pexpire" || c == "zadd" || c == "zrem"
-        || c == "lpush" || c == "hset" || c == "hdel" || c == "setbit"
-        || c == "rename";
+    return c == "set" || c == "del" || c == "pexpire" || c == "pexpireat"
+        || c == "zadd" || c == "zrem" || c == "lpush" || c == "lpop"
+        || c == "hset" || c == "hdel" || c == "setbit" || c == "rename";
+}
+
+// Logs a write. A relative TTL is logged as an absolute wall-clock deadline,
+// because replaying "expire in 60 s" at startup would restart the countdown.
+static void aof_log(const std::vector<std::string> &cmd, const uint8_t *frame, size_t len) {
+    if (cmd[0] != "pexpire") {
+        return aof_append(frame, len);
+    }
+    int64_t ttl_ms = 0;
+    if (!str2int(cmd[2], ttl_ms)) return;
+    std::string at = ttl_ms < 0 ? "-1" : std::to_string(get_wall_msec() + (uint64_t)ttl_ms);
+    aof_append_cmd({"pexpireat", cmd[1], at});
+}
+
+// Converts a wall-clock deadline back to the monotonic clock the heap uses;
+// a deadline already in the past maps to "now", so the key expires at once.
+static uint64_t wall_to_monotonic(uint64_t wall_ms) {
+    uint64_t now_wall = get_wall_msec();
+    uint64_t now_mono = get_monotonic_msec();
+    return wall_ms > now_wall ? now_mono + (wall_ms - now_wall) : now_mono;
+}
+
+// PEXPIREAT key unix_ms
+static void do_expireat(std::vector<std::string> &cmd, Buffer &out) {
+    int64_t at_ms = 0;
+    if (!str2int(cmd[2], at_ms)) {
+        return out_err(out, ERR_BAD_ARG, "expect int64");
+    }
+    Entry *ent = entry_lookup(cmd[1]);
+    if (ent) {
+        entry_set_deadline(ent, at_ms < 0 ? (uint64_t)-1 : wall_to_monotonic((uint64_t)at_ms));
+    }
+    return out_int(out, ent ? 1 : 0);
+}
+
+static void write_str(FILE *f, const char *data, size_t len) {
+    uint32_t n = (uint32_t)len;
+    fwrite(&n, 4, 1, f);
+    fwrite(data, 1, len, f);
 }
 
 static bool cb_save(HNode *node, void *arg) {
     FILE *f = (FILE *)arg;
     Entry *ent = container_of(node, Entry, node);
 
-    uint32_t klen = (uint32_t)ent->key.size();
-    fwrite(&klen, 4, 1, f);
-    fwrite(ent->key.data(), 1, klen, f);
-
+    write_str(f, ent->key.data(), ent->key.size());
     uint8_t typ = (uint8_t)ent->type;
     fwrite(&typ, 1, 1, f);
 
-    uint64_t expire = 0;
-    if (ent->heap_idx != (size_t)-1) {
-        expire = g_data.heap[ent->heap_idx].val;
-    }
+    // stored as wall-clock time: the monotonic clock restarts at reboot
+    int64_t ttl = entry_ttl_ms(ent);
+    uint64_t expire = ttl < 0 ? 0 : get_wall_msec() + (uint64_t)ttl;
     fwrite(&expire, 8, 1, f);
 
     if (ent->type == T_STR) {
-        uint32_t vlen = (uint32_t)ent->str.size();
-        fwrite(&vlen, 4, 1, f);
-        fwrite(ent->str.data(), 1, vlen, f);
+        write_str(f, ent->str.data(), ent->str.size());
     } else if (ent->type == T_ZSET) {
         uint32_t n = (uint32_t)hm_size(&ent->zset.hmap);
         fwrite(&n, 4, 1, f);
-        struct ZsaveCtx { FILE *f; };
-        ZsaveCtx zctx = { f };
         hm_foreach(&ent->zset.hmap, [](HNode *znode, void *arg) -> bool {
             ZNode *z = container_of(znode, ZNode, hmap);
-            FILE *fp = ((ZsaveCtx *)arg)->f;
-            double score = z->score;
-            uint32_t nlen = (uint32_t)z->len;
-            fwrite(&score, 8, 1, fp);
-            fwrite(&nlen, 4, 1, fp);
-            fwrite(z->name, 1, nlen, fp);
+            FILE *fp = (FILE *)arg;
+            fwrite(&z->score, 8, 1, fp);
+            write_str(fp, z->name, z->len);
             return true;
-        }, &zctx);
+        }, f);
     } else if (ent->type == T_LIST) {
         uint32_t n = (uint32_t)ent->list.len;
         fwrite(&n, 4, 1, f);
-        LNode *cur = ent->list.head;
-        while (cur) {
-            uint32_t vlen = (uint32_t)cur->val.size();
-            fwrite(&vlen, 4, 1, f);
-            fwrite(cur->val.data(), 1, vlen, f);
-            cur = cur->next;
+        // tail first: loading pushes each value onto the head
+        for (LNode *cur = ent->list.tail; cur; cur = cur->prev) {
+            write_str(f, cur->val.data(), cur->val.size());
         }
     } else if (ent->type == T_HASH) {
         uint32_t n = (uint32_t)hm_size(&ent->hash_map);
         fwrite(&n, 4, 1, f);
-        struct HsaveCtx { FILE *f; };
-        HsaveCtx hctx = { f };
         hm_foreach(&ent->hash_map, [](HNode *hnode, void *arg) -> bool {
             HEntry *he = container_of(hnode, HEntry, node);
-            FILE *fp = ((HsaveCtx *)arg)->f;
-            uint32_t flen = (uint32_t)he->field.size();
-            uint32_t vlen = (uint32_t)he->val.size();
-            fwrite(&flen, 4, 1, fp);
-            fwrite(he->field.data(), 1, flen, fp);
-            fwrite(&vlen, 4, 1, fp);
-            fwrite(he->val.data(), 1, vlen, fp);
+            FILE *fp = (FILE *)arg;
+            write_str(fp, he->field.data(), he->field.size());
+            write_str(fp, he->val.data(), he->val.size());
             return true;
-        }, &hctx);
+        }, f);
     }
     return true;
 }
 
+// Writes to a temporary file and renames it over the snapshot, so a crash
+// mid-write leaves the previous snapshot intact.
 static int save_snapshot(const char *path) {
-    FILE *f = fopen(path, "w");
+    std::string tmp = std::string(path) + ".tmp";
+    FILE *f = fopen(tmp.c_str(), "w");
     if (!f) return -1;
 
-    uint64_t magic = 0x44424d535052494dULL; // "PRISMDB\n" reversed
-    // Actually just write the string
-    fprintf(f, "PRISMDB\n");
-
+    fwrite("PRISMDB\n", 1, 8, f);
     uint32_t count = (uint32_t)hm_size(&g_data.db);
     fwrite(&count, 4, 1, f);
-
     hm_foreach(&g_data.db, &cb_save, (void *)f);
 
-    fclose(f);
+    bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    ok = fclose(f) == 0 && ok;
+    if (!ok || rename(tmp.c_str(), path) != 0) {
+        remove(tmp.c_str());
+        return -1;
+    }
     return 0;
 }
 
+static bool read_str(FILE *f, std::string &out) {
+    uint32_t len = 0;
+    if (fread(&len, 4, 1, f) != 1 || len > k_max_msg) return false;
+    out.resize(len);
+    return fread(&out[0], 1, len, f) == len;
+}
+
+static bool load_value(FILE *f, Entry *ent) {
+    if (ent->type == T_STR) {
+        return read_str(f, ent->str);
+    }
+    uint32_t n = 0;
+    if (fread(&n, 4, 1, f) != 1) return false;
+    for (uint32_t i = 0; i < n; i++) {
+        std::string a, b;
+        if (ent->type == T_ZSET) {
+            double score = 0;
+            if (fread(&score, 8, 1, f) != 1 || !read_str(f, a)) return false;
+            zset_insert(&ent->zset, a.data(), a.size(), score);
+        } else if (ent->type == T_LIST) {
+            if (!read_str(f, a)) return false;
+            llist_push(&ent->list, a);
+        } else if (ent->type == T_HASH) {
+            if (!read_str(f, a) || !read_str(f, b)) return false;
+            HEntry *he = new HEntry();
+            he->field.swap(a);
+            he->val.swap(b);
+            he->node.hcode = str_hash((uint8_t *)he->field.data(), he->field.size());
+            hm_insert(&ent->hash_map, &he->node);
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Returns 0 on success, -1 if the file is absent or corrupt. On corruption the
+// keys read before the damaged record stay loaded.
 static int load_snapshot(const char *path) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
 
-    // check magic
     uint8_t magic[8];
-    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "PRISMDB\n", 8) != 0) {
+    uint32_t count = 0;
+    if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "PRISMDB\n", 8) != 0
+        || fread(&count, 4, 1, f) != 1) {
         fclose(f);
         return -1;
     }
 
-    uint32_t count = 0;
-    if (fread(&count, 4, 1, f) != 1) { fclose(f); return -1; }
-
+    int rv = 0;
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t klen = 0;
-        if (fread(&klen, 4, 1, f) != 1) break;
-        std::string key((size_t)klen, '\0');
-        if (fread(&key[0], 1, klen, f) != klen) break;
-
+        Entry *ent = entry_new(T_INIT);
         uint8_t typ = 0;
-        if (fread(&typ, 1, 1, f) != 1) break;
-
         uint64_t expire = 0;
-        if (fread(&expire, 8, 1, f) != 1) break;
-
-        Entry *ent = entry_new(typ);
-        ent->key = key;
-        ent->node.hcode = str_hash((uint8_t *)key.data(), key.size());
-
-        if (typ == T_STR) {
-            uint32_t vlen = 0;
-            if (fread(&vlen, 4, 1, f) != 1) break;
-            ent->str.resize(vlen);
-            if (fread(&ent->str[0], 1, vlen, f) != vlen) break;
-        } else if (typ == T_ZSET) {
-            uint32_t n = 0;
-            if (fread(&n, 4, 1, f) != 1) break;
-            for (uint32_t j = 0; j < n; j++) {
-                double score = 0;
-                if (fread(&score, 8, 1, f) != 1) break;
-                uint32_t nlen = 0;
-                if (fread(&nlen, 4, 1, f) != 1) break;
-                std::string name((size_t)nlen, '\0');
-                if (fread(&name[0], 1, nlen, f) != nlen) break;
-                zset_insert(&ent->zset, name.data(), name.size(), score);
-            }
-        } else if (typ == T_LIST) {
-            uint32_t n = 0;
-            if (fread(&n, 4, 1, f) != 1) break;
-            for (uint32_t j = 0; j < n; j++) {
-                uint32_t vlen = 0;
-                if (fread(&vlen, 4, 1, f) != 1) break;
-                std::string s((size_t)vlen, '\0');
-                if (fread(&s[0], 1, vlen, f) != vlen) break;
-                llist_push(&ent->list, s);
-            }
-        } else if (typ == T_HASH) {
-            uint32_t n = 0;
-            if (fread(&n, 4, 1, f) != 1) break;
-            for (uint32_t j = 0; j < n; j++) {
-                uint32_t flen = 0, vlen = 0;
-                if (fread(&flen, 4, 1, f) != 1) break;
-                std::string field((size_t)flen, '\0');
-                if (fread(&field[0], 1, flen, f) != flen) break;
-                if (fread(&vlen, 4, 1, f) != 1) break;
-                std::string val((size_t)vlen, '\0');
-                if (fread(&val[0], 1, vlen, f) != vlen) break;
-                HEntry *he = new HEntry();
-                he->field = field;
-                he->val = val;
-                he->node.hcode = str_hash((uint8_t *)field.data(), field.size());
-                hm_insert(&ent->hash_map, &he->node);
-            }
+        bool ok = read_str(f, ent->key) && fread(&typ, 1, 1, f) == 1
+            && fread(&expire, 8, 1, f) == 1;
+        ent->type = typ;
+        if (!ok || !load_value(f, ent)) {
+            entry_del_sync(ent);
+            rv = -1;
+            break;
         }
-
+        if (expire > 0 && expire <= get_wall_msec()) {
+            entry_del_sync(ent);    // expired while the server was down
+            continue;
+        }
+        ent->node.hcode = str_hash((uint8_t *)ent->key.data(), ent->key.size());
         hm_insert(&g_data.db, &ent->node);
-
-        // restore TTL
         if (expire > 0) {
-            uint64_t now = get_monotonic_msec();
-            if (expire > now) {
-                ent->heap_idx = g_data.heap.size();
-                HeapItem item = {expire, &ent->heap_idx};
-                g_data.heap.push_back(item);
-                heap_update(g_data.heap.data(), ent->heap_idx, g_data.heap.size());
-            } else {
-                // already expired, skip it? or delete it now
-                HNode *n = hm_delete(&g_data.db, &ent->node, &hnode_same);
-                if (n) entry_del(ent);
-            }
+            entry_set_deadline(ent, wall_to_monotonic(expire));
         }
     }
 
     fclose(f);
-    return 0;
+    return rv;
 }
 
-static void aof_replay() {
-    FILE *f = fopen("prism.aof", "r");
+static void aof_replay(const char *path) {
+    FILE *f = fopen(path, "r");
     if (!f) return;
 
     uint8_t header[4];
@@ -1285,38 +1337,98 @@ static void aof_replay() {
         memcpy(&body_len, header, 4);
         if (body_len > k_max_msg) break;
 
-        uint8_t *body = (uint8_t *)malloc(body_len);
-        if (!body) break;
-        if (fread(body, 1, body_len, f) != body_len) {
-            free(body);
-            break;
-        }
+        std::vector<uint8_t> body(body_len);
+        if (fread(body.data(), 1, body_len, f) != body_len) break;
 
         cmd.clear();
-        if (parse_req(body, body_len, cmd) == 0 && !cmd.empty()) {
+        if (parse_req(body.data(), body_len, cmd) == 0 && !cmd.empty()) {
+            dummy.clear();
             do_request(cmd, NULL, dummy);
         }
-        free(body);
     }
     fclose(f);
-    fprintf(stderr, "aof replay done\n");
+    fprintf(stderr, "aof replay done: %s\n", path);
+}
+
+static void persistence_init() {
+    if (load_snapshot(k_rdb_path) == 0) {
+        fprintf(stderr, "loaded snapshot\n");
+    }
+    aof_replay(k_aof_pre_path);
+    aof_replay(k_aof_path);
+    aof_open();
+    aof_last_sync_ms = get_monotonic_msec();
+}
+
+// the log restarts empty once a snapshot covers everything in it
+static void aof_reset() {
+    if (aof_file) fclose(aof_file);
+    remove(k_aof_pre_path);
+    aof_file = fopen(k_aof_path, "w");
+    aof_dirty = false;
+}
+
+// appends the current log to prism.aof.pre and starts an empty log
+static int aof_rotate_for_bgsave() {
+    if (aof_file) fclose(aof_file);
+    aof_file = NULL;
+    FILE *src = fopen(k_aof_path, "r");
+    FILE *dst = fopen(k_aof_pre_path, "a");
+    int rv = src && dst ? 0 : -1;
+    char buf[64 * 1024];
+    size_t n = 0;
+    while (rv == 0 && (n = fread(buf, 1, sizeof(buf), src)) > 0) {
+        if (fwrite(buf, 1, n, dst) != n) rv = -1;
+    }
+    if (dst && (fflush(dst) != 0 || fsync(fileno(dst)) != 0)) rv = -1;
+    if (src) fclose(src);
+    if (dst) fclose(dst);
+    aof_file = fopen(k_aof_path, rv == 0 ? "w" : "a");
+    aof_dirty = false;
+    return rv;
+}
+
+// collects finished bgsave children so they do not linger as zombies
+static void reap_children() {
+    int status = 0;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (pid != bgsave_pid) continue;
+        bgsave_pid = -1;
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            remove(k_aof_pre_path);
+        } else {
+            fprintf(stderr, "bgsave failed, keeping %s\n", k_aof_pre_path);
+        }
+    }
 }
 
 static void do_save(std::vector<std::string> &, Buffer &out) {
-    if (save_snapshot("prism.rdb") == 0) {
-        out_nil(out);
-    } else {
-        out_err(out, ERR_UNKNOWN, "save failed");
+    if (bgsave_pid != -1) {
+        return out_err(out, ERR_UNKNOWN, "bgsave in progress");
     }
+    if (save_snapshot(k_rdb_path) != 0) {
+        return out_err(out, ERR_UNKNOWN, "save failed");
+    }
+    aof_reset();
+    out_nil(out);
 }
 
 static void do_bgsave(std::vector<std::string> &, Buffer &out) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        // child: save and exit
-        save_snapshot("prism.rdb");
-        _exit(0);
+    if (bgsave_pid != -1) {
+        return out_err(out, ERR_UNKNOWN, "bgsave in progress");
     }
+    if (aof_rotate_for_bgsave() != 0) {
+        return out_err(out, ERR_UNKNOWN, "cannot rotate the append-only file");
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        return out_err(out, ERR_UNKNOWN, "fork failed");
+    }
+    if (pid == 0) {
+        _exit(save_snapshot(k_rdb_path) == 0 ? 0 : 1);
+    }
+    bgsave_pid = pid;
     out_int(out, (int64_t)pid);
 }
 
@@ -1336,6 +1448,8 @@ static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
         return do_del(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "pexpire") {
         return do_expire(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "pexpireat") {
+        return do_expireat(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "pttl") {
         return do_ttl(cmd, out);
     } else if (cmd.size() == 1 && cmd[0] == "keys") {
@@ -1454,7 +1568,7 @@ static bool try_one_request(Conn *conn) {
 
     // log write commands to append-only file
     if (!cmd.empty() && is_write_cmd(cmd[0])) {
-        aof_append(conn->incoming.data(), 4 + len);
+        aof_log(cmd, conn->incoming.data(), 4 + len);
     }
 
     // application logic done! remove the request message.
@@ -1541,6 +1655,11 @@ static uint32_t next_timer_ms() {
     if (!g_data.heap.empty() && g_data.heap[0].val < next_ms) {
         next_ms = g_data.heap[0].val;
     }
+    // pending fsync, or a bgsave child to reap
+    uint64_t poll_ms = bgsave_pid != -1 ? 100 : aof_dirty ? 1000 : (uint64_t)-1;
+    if (poll_ms != (uint64_t)-1 && now_ms + poll_ms < next_ms) {
+        next_ms = now_ms + poll_ms;
+    }
     // timeout value
     if (next_ms == (uint64_t)-1) {
         return -1;  // no timers, no timeouts
@@ -1552,6 +1671,8 @@ static uint32_t next_timer_ms() {
 }
 
 static void process_timers() {
+    reap_children();
+    aof_sync();
     uint64_t now_ms = get_monotonic_msec();
     // idle timers using a linked list
     while (!dlist_empty(&g_data.idle_list)) {
@@ -1582,12 +1703,7 @@ int main() {
     dlist_init(&g_data.idle_list);
     thread_pool_init(&g_data.thread_pool, 4);
 
-    // load data from disk
-    if (load_snapshot("prism.rdb") == 0) {
-        fprintf(stderr, "loaded snapshot\n");
-    }
-    aof_init();
-    aof_replay();
+    persistence_init();
 
     // the listening socket
     int fd = socket(AF_INET, SOCK_STREAM, 0);

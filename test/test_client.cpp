@@ -710,15 +710,9 @@ static void test_edge_cases(PrismConn *c) {
     for (const char *k : keys) prism_reply_free(prism_del(c, k));
 }
 
-int main(int argc, char **argv) {
-    const char *server_path = "./build/prism-server";
-    if (argc > 1) {
-        server_path = argv[1];
-    }
-
+static pid_t start_server(const char *server_path) {
     pid_t pid = fork();
     if (pid == 0) {
-        // child: start server
         execlp(server_path, server_path, (char *)NULL);
         // if exec fails, try cwd
         execl(server_path, server_path, (char *)NULL);
@@ -727,29 +721,94 @@ int main(int argc, char **argv) {
     }
     if (pid < 0) {
         perror("fork");
-        return 1;
+        return -1;
     }
-
-    // clean up persistence files from previous runs
-    remove("prism.aof");
-    remove("prism.rdb");
-
-    fprintf(stderr, "--- prism test ---\n");
-    fprintf(stderr, "server PID %d, waiting for startup...\n", (int)pid);
-
     if (wait_for_server("127.0.0.1", 1234, 3000) < 0) {
         fprintf(stderr, "server did not start in time\n");
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
+        return -1;
+    }
+    return pid;
+}
+
+static void stop_server(pid_t pid) {
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+}
+
+static bool list_equals(PrismConn *c, const char *key, const char **want, size_t n) {
+    PrismReply *r = prism_cmd(c, 4, "lrange", key, "0", "-1");
+    bool ok = r && prism_type(r) == PRISM_ARR && prism_arr_len(r) == n;
+    for (size_t i = 0; ok && i < n; i++) {
+        const char *s = prism_str(prism_arr_at(r, i), NULL);
+        ok = s && strcmp(s, want[i]) == 0;
+    }
+    prism_reply_free(r);
+    return ok;
+}
+
+// Restarts the server twice: once after a foreground save, once after a
+// bgsave, checking that the snapshot plus the log reproduce the data exactly.
+static void test_restart(const char *server_path, pid_t *pid) {
+    PrismConn *c = prism_connect("127.0.0.1", 1234);
+    prism_reply_free(prism_cmd(c, 5, "lpush", "rl", "c", "b", "a"));
+    prism_reply_free(prism_set(c, "rttl", "v"));
+    prism_reply_free(prism_pexpire(c, "rttl", 60000));
+    prism_reply_free(prism_cmd(c, 1, "save"));
+    prism_reply_free(prism_cmd(c, 3, "lpush", "rl", "z"));
+    prism_close(c);
+
+    stop_server(*pid);
+    *pid = start_server(server_path);
+    if (*pid < 0) { CHECK(0, "server restarts"); return; }
+    c = prism_connect("127.0.0.1", 1234);
+    const char *want1[] = {"z", "a", "b", "c"};
+    CHECK(list_equals(c, "rl", want1, 4), "list order and post-save writes survive restart");
+    PrismReply *r = prism_pttl(c, "rttl");
+    CHECK(r && prism_int(r) > 50000 && prism_int(r) <= 60000, "ttl survives restart without resetting");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 1, "bgsave");
+    CHECK(r && prism_type(r) == PRISM_INT, "bgsave returns pid");
+    prism_reply_free(r);
+    prism_reply_free(prism_cmd(c, 2, "lpop", "rl"));
+    usleep(500 * 1000);
+    struct stat st;
+    CHECK(stat("prism.aof.pre", &st) != 0, "pre-bgsave log removed once the child succeeds");
+    prism_close(c);
+
+    stop_server(*pid);
+    *pid = start_server(server_path);
+    if (*pid < 0) { CHECK(0, "server restarts after bgsave"); return; }
+    c = prism_connect("127.0.0.1", 1234);
+    const char *want2[] = {"a", "b", "c"};
+    CHECK(list_equals(c, "rl", want2, 3), "bgsave snapshot plus log restore the list exactly");
+    prism_close(c);
+}
+
+int main(int argc, char **argv) {
+    const char *server_path = "./build/prism-server";
+    if (argc > 1) {
+        server_path = argv[1];
+    }
+
+    // clean up persistence files from previous runs
+    remove("prism.aof");
+    remove("prism.aof.pre");
+    remove("prism.rdb");
+
+    fprintf(stderr, "--- prism test ---\n");
+    pid_t pid = start_server(server_path);
+    if (pid < 0) {
         return 1;
     }
-    fprintf(stderr, "server ready.\n\n");
+    fprintf(stderr, "server PID %d ready.\n\n", (int)pid);
 
     PrismConn *c = prism_connect("127.0.0.1", 1234);
     if (!c) {
         fprintf(stderr, "failed to connect\n");
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
+        stop_server(pid);
         return 1;
     }
 
@@ -769,9 +828,9 @@ int main(int argc, char **argv) {
     test_persistence(c);
 
     prism_close(c);
+    test_restart(server_path, &pid);
 
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
+    if (pid > 0) stop_server(pid);
 
     fprintf(stderr, "\n%d / %d tests passed\n", passed, tests);
     return passed == tests ? 0 : 1;

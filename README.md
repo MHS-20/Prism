@@ -8,8 +8,9 @@ A minimal key-value Cache and Data Structure Server.
 
 ## Persistence
 
-- **Append-only file (AOF)** — every write command (`set`, `del`, `pexpire`, `zadd`, `zrem`) is logged to `prism.aof`. On restart, the file is replayed to restore state.
-- **Snapshot (RDB)** — `save` dumps all keys to `prism.rdb` synchronously. `bgsave` forks a child process to do the dump in the background.
+- **Snapshot (RDB)** — `save` dumps all keys to `prism.rdb` synchronously. `bgsave` forks a child process to do the dump in the background while the server keeps serving. The snapshot is written to a temporary file and renamed into place, so a crash mid-write keeps the previous snapshot. Expiry deadlines are stored as wall-clock time, so TTLs stay correct across a machine reboot.
+- **Append-only file (AOF)** — every write command (`set`, `del`, `pexpire`, `pexpireat`, `zadd`, `zrem`, `lpush`, `lpop`, `hset`, `hdel`, `setbit`, `rename`) is logged to `prism.aof`, and the file is fsynced at most once per second. `pexpire` is logged as `pexpireat` with an absolute deadline, so replaying it does not restart the countdown.
+- **Startup** — load `prism.rdb`, then replay the log. The log only holds writes made after the snapshot: a successful `save` empties it. A `bgsave` moves the current log to `prism.aof.pre` at fork time and deletes that file once the child succeeds; if the child fails, or the server stops first, startup replays `prism.aof.pre` before `prism.aof`.
 
 ## Features
 
@@ -61,6 +62,7 @@ All arguments are strings. Numbers are parsed from strings.
 | `set` | `key` `value` | Create or overwrite a string key |
 | `del` | `key` | Delete a key. Returns 1 if deleted, 0 otherwise |
 | `pexpire` | `key` `ttl_ms` | Set TTL in milliseconds on a key. Returns 1 if exists |
+| `pexpireat` | `key` `unix_ms` | Set an absolute expiry as a Unix timestamp in milliseconds; negative removes the TTL. Returns 1 if exists |
 | `pttl` | `key` | Return remaining TTL in ms, `-1` if no TTL, `-2` if not found |
 | `keys` | *(none)* | Return array of all keys |
 | `zadd` | `zset` `score` `name` | Add member to sorted set. Returns 1 if new, 0 if updated |
@@ -88,8 +90,8 @@ All arguments are strings. Numbers are parsed from strings.
 | `subscribe` | `channel [channel ...]` | Subscribe to channels. Puts connection into pub/sub mode |
 | `unsubscribe` | `[channel ...]` | Unsubscribe from channels. Each channel returns `["unsubscribe", channel, count]`. If no channels given, unsubscribes from all |
 | `publish` | `channel` `message` | Send a message to all subscribers of a channel. Returns the number of subscribers that received it |
-| `save` | *(none)* | Synchronously dump snapshot to `prism.rdb` |
-| `bgsave` | *(none)* | Fork a child to dump snapshot to `prism.rdb` in background. Returns child PID |
+| `save` | *(none)* | Synchronously dump snapshot to `prism.rdb` and empty the log. Fails while a `bgsave` runs |
+| `bgsave` | *(none)* | Fork a child to dump snapshot to `prism.rdb` in background. Returns child PID; fails while another `bgsave` runs |
 
 ## Architecture
 
