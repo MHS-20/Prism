@@ -147,21 +147,10 @@ static int32_t handle_accept(int fd) {
     return 0;
 }
 
-static void conn_destroy(Conn *conn) {
-    // remove from pub/sub channels
-    for (const std::string &ch : conn->channels) {
-        auto it = g_data.subs.find(ch);
-        if (it != g_data.subs.end()) {
-            std::vector<Conn *> &vec = it->second;
-            vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
-            if (vec.empty()) {
-                g_data.subs.erase(it);
-            }
-        }
-    }
-    conn->channels.clear();
-    conn->subscribed = false;
+static void pubsub_forget(Conn *conn);
 
+static void conn_destroy(Conn *conn) {
+    pubsub_forget(conn);
     (void)close(conn->fd);
     g_data.fd2conn[conn->fd] = NULL;
     dlist_detach(&conn->idle_node);
@@ -976,6 +965,47 @@ static void response_begin(Buffer &out, size_t *header);
 static void response_end(Buffer &out, size_t header);
 static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out);
 
+// A subscribed client's output is bounded: a subscriber that stops reading
+// is disconnected instead of growing its buffer without limit.
+const size_t k_max_pending_out = 2 * k_max_msg;
+
+static void sub_remove(const std::string &channel, Conn *conn) {
+    auto it = g_data.subs.find(channel);
+    if (it == g_data.subs.end()) {
+        return;
+    }
+    std::vector<Conn *> &vec = it->second;
+    vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
+    if (vec.empty()) {
+        g_data.subs.erase(it);
+    }
+}
+
+static void pubsub_forget(Conn *conn) {
+    for (const std::string &ch : conn->channels) {
+        sub_remove(ch, conn);
+    }
+    conn->channels.clear();
+    conn->subscribed = false;
+}
+
+// Each subscribe/unsubscribe acknowledgement is its own frame, one per
+// channel, as in Redis. Packing several values into one frame would break the
+// one-value-per-frame rule the client relies on to match replies.
+static void out_pubsub_frame(Buffer &out, const char *kind, const std::string *channel, int64_t n) {
+    size_t header = 0;
+    response_begin(out, &header);
+    out_arr(out, 3);
+    out_str(out, kind, strlen(kind));
+    if (channel) {
+        out_str(out, channel->data(), channel->size());
+    } else {
+        out_nil(out);
+    }
+    out_int(out, n);
+    response_end(out, header);
+}
+
 // subscribe channel [channel ...]
 static void do_subscribe(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
     for (size_t i = 1; i < cmd.size(); i++) {
@@ -985,63 +1015,35 @@ static void do_subscribe(std::vector<std::string> &cmd, Conn *conn, Buffer &out)
             conn->channels.push_back(channel);
             g_data.subs[channel].push_back(conn);
         }
-        out_arr(out, 3);
-        out_str(out, "subscribe", 9);
-        out_str(out, channel.data(), channel.size());
-        out_int(out, (int64_t)conn->channels.size());
+        out_pubsub_frame(out, "subscribe", &channel, (int64_t)conn->channels.size());
     }
     conn->subscribed = true;
 }
 
-// unsubscribe [channel ...]
+// unsubscribe [channel ...]; no channels means all of them
 static void do_unsubscribe(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
-    if (cmd.size() == 1) {
-        // unsubscribe all
-        std::vector<std::string> all = conn->channels;
-        for (size_t i = 0; i < all.size(); i++) {
-            auto it = g_data.subs.find(all[i]);
-            if (it != g_data.subs.end()) {
-                std::vector<Conn *> &vec = it->second;
-                vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
-                if (vec.empty()) {
-                    g_data.subs.erase(it);
-                }
-            }
-            out_arr(out, 3);
-            out_str(out, "unsubscribe", 11);
-            out_str(out, all[i].data(), all[i].size());
-            out_int(out, (int64_t)(all.size() - 1 - i));
+    std::vector<std::string> targets(cmd.begin() + 1, cmd.end());
+    if (targets.empty()) {
+        targets = conn->channels;
+    }
+    if (targets.empty()) {
+        out_pubsub_frame(out, "unsubscribe", NULL, 0);
+    }
+    for (const std::string &channel : targets) {
+        auto it = std::find(conn->channels.begin(), conn->channels.end(), channel);
+        if (it != conn->channels.end()) {
+            conn->channels.erase(it);
+            sub_remove(channel, conn);
         }
-        conn->channels.clear();
+        out_pubsub_frame(out, "unsubscribe", &channel, (int64_t)conn->channels.size());
+    }
+    if (conn->channels.empty()) {
         conn->subscribed = false;
-    } else {
-        for (size_t i = 1; i < cmd.size(); i++) {
-            const std::string &channel = cmd[i];
-            auto it = std::find(conn->channels.begin(), conn->channels.end(), channel);
-            if (it != conn->channels.end()) {
-                conn->channels.erase(it);
-                auto sit = g_data.subs.find(channel);
-                if (sit != g_data.subs.end()) {
-                    std::vector<Conn *> &vec = sit->second;
-                    vec.erase(std::remove(vec.begin(), vec.end(), conn), vec.end());
-                    if (vec.empty()) {
-                        g_data.subs.erase(sit);
-                    }
-                }
-            }
-            out_arr(out, 3);
-            out_str(out, "unsubscribe", 11);
-            out_str(out, channel.data(), channel.size());
-            out_int(out, (int64_t)conn->channels.size());
-        }
-        if (conn->channels.empty()) {
-            conn->subscribed = false;
-        }
     }
 }
 
 // publish channel message
-static void do_publish(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
+static void do_publish(std::vector<std::string> &cmd, Conn *, Buffer &out) {
     const std::string &channel = cmd[1];
     const std::string &msg = cmd[2];
 
@@ -1058,12 +1060,22 @@ static void do_publish(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
         out_str(notification, msg.data(), msg.size());
         response_end(notification, header);
 
+        std::vector<Conn *> too_slow;
         for (Conn *sub : it->second) {
+            if (sub->outgoing.size() + notification.size() > k_max_pending_out) {
+                too_slow.push_back(sub);
+                continue;
+            }
             buf_append(sub->outgoing, notification.data(), notification.size());
             sub->want_read = false;
             sub->want_write = true;
+            count++;
         }
-        count = (int64_t)it->second.size();
+        // destroyed after the loop, because it edits the subscriber list
+        for (Conn *sub : too_slow) {
+            fprintf(stderr, "dropping slow subscriber: %d\n", sub->fd);
+            conn_destroy(sub);
+        }
     }
 
     out_int(out, count);
@@ -1499,12 +1511,8 @@ static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
     } else if (cmd.size() == 2 && cmd[0] == "object") {
         return do_object(cmd, out);
     } else if (cmd[0] == "subscribe") {
-        if (cmd.size() < 2) {
-            return out_err(out, ERR_BAD_ARG, "wrong number of arguments for subscribe");
-        }
-        return do_subscribe(cmd, conn, out);
-    } else if (cmd[0] == "unsubscribe") {
-        return do_unsubscribe(cmd, conn, out);
+        // a valid subscribe is answered by try_one_request with one frame per channel
+        return out_err(out, ERR_BAD_ARG, "wrong number of arguments for subscribe");
     } else if (cmd.size() == 3 && cmd[0] == "publish") {
         return do_publish(cmd, conn, out);
     } else if (cmd.size() == 1 && cmd[0] == "save") {
@@ -1561,10 +1569,16 @@ static bool try_one_request(Conn *conn) {
         conn->want_close = true;
         return false;   // want close
     }
-    size_t header_pos = 0;
-    response_begin(conn->outgoing, &header_pos);
-    do_request(cmd, conn, conn->outgoing);
-    response_end(conn->outgoing, header_pos);
+    if (cmd.size() >= 2 && cmd[0] == "subscribe") {
+        do_subscribe(cmd, conn, conn->outgoing);
+    } else if (!cmd.empty() && cmd[0] == "unsubscribe") {
+        do_unsubscribe(cmd, conn, conn->outgoing);
+    } else {
+        size_t header_pos = 0;
+        response_begin(conn->outgoing, &header_pos);
+        do_request(cmd, conn, conn->outgoing);
+        response_end(conn->outgoing, header_pos);
+    }
 
     // log write commands to append-only file
     if (!cmd.empty() && is_write_cmd(cmd[0])) {
@@ -1643,7 +1657,7 @@ static void handle_read(Conn *conn) {
 
 const uint64_t k_idle_timeout_ms = 5 * 1000;
 
-static uint32_t next_timer_ms() {
+static int32_t next_timer_ms() {
     uint64_t now_ms = get_monotonic_msec();
     uint64_t next_ms = (uint64_t)-1;
     // idle timers using a linked list
@@ -1667,7 +1681,7 @@ static uint32_t next_timer_ms() {
     if (next_ms <= now_ms) {
         return 0;   // missed?
     }
-    return (int32_t)(next_ms - now_ms);
+    return (int32_t)std::min<uint64_t>(next_ms - now_ms, INT32_MAX);
 }
 
 static void process_timers() {
@@ -1778,7 +1792,13 @@ int main() {
             if (ready == 0) {
                 continue;
             }
+            // flags and liveness can change mid-iteration: a publish earlier
+            // in this loop may have flipped this connection to writing, or
+            // destroyed it as a slow subscriber
             Conn *conn = g_data.fd2conn[poll_args[i].fd];
+            if (!conn) {
+                continue;
+            }
 
             // update the idle timer by moving conn to the end of the list
             conn->last_active_ms = get_monotonic_msec();
@@ -1786,12 +1806,10 @@ int main() {
             dlist_insert_before(&g_data.idle_list, &conn->idle_node);
 
             // handle IO
-            if (ready & POLLIN) {
-                assert(conn->want_read);
+            if ((ready & POLLIN) && conn->want_read) {
                 handle_read(conn);  // application logic
             }
-            if (ready & POLLOUT) {
-                assert(conn->want_write);
+            if ((ready & POLLOUT) && conn->want_write) {
                 handle_write(conn); // application logic
             }
 

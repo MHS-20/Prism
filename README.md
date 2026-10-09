@@ -87,9 +87,9 @@ All arguments are strings. Numbers are parsed from strings.
 | `scan` | `cursor` `[COUNT n]` | Incremental key iteration. Returns `[next_cursor, keys...]` |
 | `debug` | *(none)* | Return server info (key count, connections) |
 | `object` | `key` | Return metadata about a key: type and remaining TTL in ms (`-1` if none) |
-| `subscribe` | `channel [channel ...]` | Subscribe to channels. Puts connection into pub/sub mode |
-| `unsubscribe` | `[channel ...]` | Unsubscribe from channels. Each channel returns `["unsubscribe", channel, count]`. If no channels given, unsubscribes from all |
-| `publish` | `channel` `message` | Send a message to all subscribers of a channel. Returns the number of subscribers that received it |
+| `subscribe` | `channel [channel ...]` | Subscribe to channels. Puts connection into pub/sub mode. Answers one `["subscribe", channel, count]` frame per channel |
+| `unsubscribe` | `[channel ...]` | Unsubscribe from channels, one `["unsubscribe", channel, count]` frame per channel. If no channels given, unsubscribes from all; with none subscribed it answers a single frame with a nil channel |
+| `publish` | `channel` `message` | Send a message to all subscribers of a channel. Returns the number of subscribers that received it. A subscriber with more than 64 MB of unsent output is disconnected instead |
 | `save` | *(none)* | Synchronously dump snapshot to `prism.rdb` and empty the log. Fails while a `bgsave` runs |
 | `bgsave` | *(none)* | Fork a child to dump snapshot to `prism.rdb` in background. Returns child PID; fails while another `bgsave` runs |
 
@@ -287,23 +287,3 @@ prism_reply_free(r);
 
 prism_close(sub);
 ```
-
-## Project layout
-
-| Path | Role |
-|---|---|
-| `server/` | Server source (event loop, data structures, protocol) |
-| `client/` | Client library (`prism.h`, `prism.cpp`) |
-| `CMakeLists.txt` | Top-level CMake (builds both targets) |
-| `Makefile` | Convenience wrapper for CMake |
-
-### Data structures
-
-| Structure | File | Used for |
-|---|---|---|
-| `HMap` (2× `HTab`) | `server/hashtable.h/.cpp` | Top-level KV store, zset name index |
-| `AVLNode` | `server/avl.h/.cpp` | Zset ordering by `(score, name)`, rank queries |
-| `ZSet` / `ZNode` | `server/zset.h/.cpp` | Sorted set abstraction |
-| `HeapItem` | `server/heap.h/.cpp` | TTL expiry queue |
-| `DList` | `server/list.h` | Idle connection LRU |
-| `ThreadPool` | `server/thread_pool.h/.cpp` | Async large-object cleanup |

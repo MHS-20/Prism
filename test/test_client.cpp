@@ -710,6 +710,46 @@ static void test_edge_cases(PrismConn *c) {
     for (const char *k : keys) prism_reply_free(prism_del(c, k));
 }
 
+static void test_pubsub_frames(void) {
+    PrismConn *sub = prism_connect("127.0.0.1", 1234);
+    PrismConn *pub = prism_connect("127.0.0.1", 1234);
+    if (!sub || !pub) { CHECK(0, "pubsub frame clients connect"); return; }
+
+    // two channels: two acknowledgements, each in its own frame
+    PrismReply *r = prism_cmd(sub, 3, "subscribe", "fa", "fb");
+    CHECK(r && prism_arr_len(r) == 3 && prism_int(prism_arr_at(r, 2)) == 1, "first subscribe ack");
+    prism_reply_free(r);
+    r = prism_read_next(sub);
+    CHECK(r && prism_arr_len(r) == 3 && prism_int(prism_arr_at(r, 2)) == 2, "second subscribe ack is a separate frame");
+    prism_reply_free(r);
+
+    // a publisher and the subscriber's next command in the same poll round
+    // must not trip the event loop
+    prism_reply_free(prism_cmd(pub, 3, "publish", "fa", "m1"));
+    r = prism_read_next(sub);
+    const char *s = r ? prism_str(prism_arr_at(r, 2), NULL) : NULL;
+    CHECK(s && strcmp(s, "m1") == 0, "message delivered");
+    prism_reply_free(r);
+
+    r = prism_cmd(sub, 1, "unsubscribe");
+    CHECK(r && prism_arr_len(r) == 3, "unsubscribe all acks first channel");
+    prism_reply_free(r);
+    r = prism_read_next(sub);
+    CHECK(r && prism_int(prism_arr_at(r, 2)) == 0, "unsubscribe all acks second channel");
+    prism_reply_free(r);
+
+    r = prism_cmd(sub, 1, "unsubscribe");
+    CHECK(r && prism_arr_len(r) == 3 && prism_type(prism_arr_at(r, 1)) == PRISM_NIL,
+          "unsubscribe with no channels still answers one frame");
+    prism_reply_free(r);
+    r = prism_get(sub, "x");
+    CHECK(r && prism_type(r) != PRISM_ERR, "connection is in sync after unsubscribing");
+    prism_reply_free(r);
+
+    prism_close(sub);
+    prism_close(pub);
+}
+
 static pid_t start_server(const char *server_path) {
     pid_t pid = fork();
     if (pid == 0) {
@@ -825,6 +865,7 @@ int main(int argc, char **argv) {
     test_misc(c);
     test_client_features(c);
     test_pubsub(c);
+    test_pubsub_frames();
     test_persistence(c);
 
     prism_close(c);
