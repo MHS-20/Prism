@@ -657,6 +657,17 @@ static void test_persistence(PrismConn *c) {
     remove("prism.aof");
 }
 
+static void test_empty_command(PrismConn *c) {
+    PrismReply *r = prism_cmdv(c, NULL, 0);
+    if (!r) { CHECK(0, "empty command reply non-null"); return; }
+    CHECK(prism_type(r) == PRISM_ERR, "empty command returns error");
+    prism_reply_free(r);
+
+    r = prism_set(c, "after-empty", "ok");
+    CHECK(r && prism_type(r) == PRISM_NIL, "server alive after empty command");
+    prism_reply_free(r);
+}
+
 int main(int argc, char **argv) {
     const char *server_path = "./build/prism-server";
     if (argc > 1) {
@@ -701,6 +712,7 @@ int main(int argc, char **argv) {
     }
 
     test_basic_kv(c);
+    test_empty_command(c);
     test_del(c);
     test_ttl(c);
     test_keys(c);

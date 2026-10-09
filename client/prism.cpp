@@ -38,22 +38,22 @@ static void buf_put_data(uint8_t **p, const void *d, size_t n) {
 }
 
 static bool buf_get_u8(const uint8_t **p, const uint8_t *end, uint8_t *v) {
-    if (*p + 1 > end) return false;
+    if ((size_t)(end - *p) < 1) return false;
     *v = *(*p)++;
     return true;
 }
 static bool buf_get_u32(const uint8_t **p, const uint8_t *end, uint32_t *v) {
-    if (*p + 4 > end) return false;
+    if ((size_t)(end - *p) < 4) return false;
     memcpy(v, *p, 4); *p += 4;
     return true;
 }
 static bool buf_get_i64(const uint8_t **p, const uint8_t *end, int64_t *v) {
-    if (*p + 8 > end) return false;
+    if ((size_t)(end - *p) < 8) return false;
     memcpy(v, *p, 8); *p += 8;
     return true;
 }
 static bool buf_get_dbl(const uint8_t **p, const uint8_t *end, double *v) {
-    if (*p + 8 > end) return false;
+    if ((size_t)(end - *p) < 8) return false;
     memcpy(v, *p, 8); *p += 8;
     return true;
 }
@@ -164,15 +164,19 @@ static PrismReply *reply_new_arr(size_t n) {
 }
 
 // forward declaration
-static bool parse_value(const uint8_t **p, const uint8_t *end, PrismReply *r);
+// Each nested array costs a stack frame, so nesting is capped to keep a
+// malicious reply from overflowing the stack.
+static const uint32_t k_max_depth = 64;
+
+static bool parse_value(const uint8_t **p, const uint8_t *end, PrismReply *r, uint32_t depth);
 
 static bool parse_reply_body(const uint8_t *data, size_t size, PrismReply *r) {
     const uint8_t *p = data;
     const uint8_t *end = data + size;
-    return parse_value(&p, end, r);
+    return parse_value(&p, end, r, 0);
 }
 
-static bool parse_value(const uint8_t **p, const uint8_t *end, PrismReply *r) {
+static bool parse_value(const uint8_t **p, const uint8_t *end, PrismReply *r, uint32_t depth) {
     uint8_t tag = 0;
     if (!buf_get_u8(p, end, &tag)) return false;
 
@@ -185,7 +189,7 @@ static bool parse_value(const uint8_t **p, const uint8_t *end, PrismReply *r) {
         uint32_t len = 0;
         if (!buf_get_u32(p, end, &code)) return false;
         if (!buf_get_u32(p, end, &len)) return false;
-        if (*p + len > end) return false;
+        if ((size_t)(end - *p) < len) return false;
         r->tag = PRISM_ERR;
         r->u.err.code = code;
         r->u.err.msg = (char *)malloc(len + 1);
@@ -198,7 +202,7 @@ static bool parse_value(const uint8_t **p, const uint8_t *end, PrismReply *r) {
     case 2: { // str
         uint32_t len = 0;
         if (!buf_get_u32(p, end, &len)) return false;
-        if (*p + len > end) return false;
+        if ((size_t)(end - *p) < len) return false;
         r->tag = PRISM_STR;
         r->u.str.data = (char *)malloc(len + 1);
         memcpy(r->u.str.data, *p, len);
@@ -224,11 +228,14 @@ static bool parse_value(const uint8_t **p, const uint8_t *end, PrismReply *r) {
     case 5: { // arr
         uint32_t n = 0;
         if (!buf_get_u32(p, end, &n)) return false;
+        // every element takes at least one byte, so a larger count is a lie
+        // and must not size an allocation
+        if (depth >= k_max_depth || n > (size_t)(end - *p)) return false;
         r->tag = PRISM_ARR;
         r->u.arr.n = n;
         r->u.arr.items = (PrismReply *)calloc(n, sizeof(PrismReply));
         for (uint32_t i = 0; i < n; i++) {
-            if (!parse_value(p, end, &r->u.arr.items[i])) {
+            if (!parse_value(p, end, &r->u.arr.items[i], depth + 1)) {
                 return false;
             }
         }

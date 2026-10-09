@@ -170,7 +170,7 @@ static void conn_destroy(Conn *conn) {
 const size_t k_max_args = 200 * 1000;
 
 static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out) {
-    if (cur + 4 > end) {
+    if ((size_t)(end - cur) < 4) {
         return false;
     }
     memcpy(&out, cur, 4);
@@ -180,7 +180,8 @@ static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out) {
 
 static bool
 read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out) {
-    if (cur + n > end) {
+    // `cur + n` could overflow the pointer when n comes off the wire
+    if ((size_t)(end - cur) < n) {
         return false;
     }
     out.assign(cur, cur + n);
@@ -1403,6 +1404,9 @@ static void do_bgsave(std::vector<std::string> &, Buffer &out) {
 }
 
 static void do_request(std::vector<std::string> &cmd, Conn *conn, Buffer &out) {
+    if (cmd.empty()) {
+        return out_err(out, ERR_UNKNOWN, "empty command.");
+    }
     if (conn && conn->subscribed && cmd[0] != "subscribe" && cmd[0] != "unsubscribe") {
         return out_err(out, ERR_UNKNOWN, "only subscribe/unsubscribe allowed in pub/sub mode");
     }
@@ -1532,7 +1536,7 @@ static bool try_one_request(Conn *conn) {
     response_end(conn->outgoing, header_pos);
 
     // log write commands to append-only file
-    if (is_write_cmd(cmd[0])) {
+    if (!cmd.empty() && is_write_cmd(cmd[0])) {
         aof_append(conn->incoming.data(), 4 + len);
     }
 
