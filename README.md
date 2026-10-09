@@ -19,7 +19,7 @@ A minimal key-value Cache and Data Structure Server.
 - Key enumeration (`keys`)
 - Custom binary protocol (no Redis serialisation, no HTTP)
 - Non-blocking I/O with `poll()` — single-threaded event loop
-- Thread pool (4 workers) for async destruction of large sorted sets
+- Thread pool (4 workers) for async destruction of large containers
 - Progressive rehashing hash table — no stop-the-world resizes
 - Idle connection timeout (5 s)
 - Zero external dependencies — standard C/C++ libs + pthreads
@@ -66,7 +66,7 @@ All arguments are strings. Numbers are parsed from strings.
 | `zadd` | `zset` `score` `name` | Add member to sorted set. Returns 1 if new, 0 if updated |
 | `zrem` | `zset` `name` | Remove member. Returns 1 if existed |
 | `zscore` | `zset` `name` | Return score of member, or nil |
-| `zquery` | `zset` `score` `name` `offset` `limit` | Query members >= `(score, name)` with pagination. Returns flat array of `[name, score, name, score, ...]` |
+| `zquery` | `zset` `score` `name` `offset` `limit` | Query up to `limit` members >= `(score, name)`, skipping `offset`. Returns flat array of `[name, score, name, score, ...]` |
 | `lpush` | `key` `val [val ...]` | Push values to head of list. Returns new length |
 | `lpop` | `key` | Pop value from head of list. Returns nil if empty |
 | `llen` | `key` | Return list length |
@@ -75,7 +75,7 @@ All arguments are strings. Numbers are parsed from strings.
 | `hget` | `key` `field` | Get hash field value. Returns nil if missing |
 | `hdel` | `key` `field` | Delete hash field. Returns 1 if existed |
 | `hgetall` | `key` | Return flat array of `[field, val, field, val, ...]` |
-| `setbit` | `key` `offset` `value` | Set bit at offset to 0 or 1. Returns old bit |
+| `setbit` | `key` `offset` `value` | Set bit at offset (at most 2^32 - 1) to 0 or 1. Returns old bit |
 | `getbit` | `key` `offset` | Get bit at offset |
 | `bitcount` | `key` `[start end]` | Count set bits in byte range |
 | `exists` | `key` | Return 1 if key exists, 0 otherwise |
@@ -84,7 +84,7 @@ All arguments are strings. Numbers are parsed from strings.
 | `rename` | `key` `newkey` | Rename a key. Overwrites newkey if exists |
 | `scan` | `cursor` `[COUNT n]` | Incremental key iteration. Returns `[next_cursor, keys...]` |
 | `debug` | *(none)* | Return server info (key count, connections) |
-| `object` | `key` | Return metadata about a key (type, TTL) |
+| `object` | `key` | Return metadata about a key: type and remaining TTL in ms (`-1` if none) |
 | `subscribe` | `channel [channel ...]` | Subscribe to channels. Puts connection into pub/sub mode |
 | `unsubscribe` | `[channel ...]` | Unsubscribe from channels. Each channel returns `["unsubscribe", channel, count]`. If no channels given, unsubscribes from all |
 | `publish` | `channel` `message` | Send a message to all subscribers of a channel. Returns the number of subscribers that received it |
@@ -118,11 +118,11 @@ Self-balancing binary search tree. Each node caches `height` (balance factor) an
 
 ### TTL heap
 
-Binary min-heap keyed by absolute expiry timestamp. Each `Entry` stores its heap slot index for O(log N) update/removal.
+Binary min-heap keyed by absolute expiry timestamp. Each `Entry` stores its heap slot index for O(log N) update/removal. Every key lookup also checks the deadline, so an expired key is never returned even before the timer sweep removes it.
 
 ### Thread pool
 
-4 worker threads wait on a condition variable. When a large zset (≥1000 members) is deleted, the destructor is offloaded to the pool to avoid blocking the event loop.
+4 worker threads wait on a condition variable. When a large container (a zset, list or hash with more than 1000 elements) is deleted, the destructor is offloaded to the pool to avoid blocking the event loop.
 
 ## Build
 
@@ -304,4 +304,4 @@ prism_close(sub);
 | `ZSet` / `ZNode` | `server/zset.h/.cpp` | Sorted set abstraction |
 | `HeapItem` | `server/heap.h/.cpp` | TTL expiry queue |
 | `DList` | `server/list.h` | Idle connection LRU |
-| `TheadPool` | `server/thread_pool.h/.cpp` | Async large-object cleanup |
+| `ThreadPool` | `server/thread_pool.h/.cpp` | Async large-object cleanup |

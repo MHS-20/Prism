@@ -668,6 +668,48 @@ static void test_empty_command(PrismConn *c) {
     prism_reply_free(r);
 }
 
+static void test_edge_cases(PrismConn *c) {
+    PrismReply *r;
+
+    prism_reply_free(prism_cmd(c, 5, "lpush", "edge-list", "c", "b", "a"));
+    r = prism_cmd(c, 4, "lrange", "edge-list", "2", "0");
+    CHECK(r && prism_type(r) == PRISM_ARR && prism_arr_len(r) == 0, "lrange with start > stop is empty");
+    prism_reply_free(r);
+    r = prism_cmd(c, 4, "lrange", "edge-list", "", "1");
+    CHECK(r && prism_type(r) == PRISM_ERR, "lrange rejects an empty index");
+    prism_reply_free(r);
+
+    prism_reply_free(prism_zadd(c, "edge-z", 1, "a"));
+    prism_reply_free(prism_zadd(c, "edge-z", 2, "b"));
+    prism_reply_free(prism_zadd(c, "edge-z", 3, "c"));
+    r = prism_zquery(c, "edge-z", 0, "", 0, 2);
+    CHECK(r && prism_arr_len(r) == 4, "zquery limit counts members");
+    prism_reply_free(r);
+    r = prism_cmd(c, 4, "zadd", "edge-z", "", "x");
+    CHECK(r && prism_type(r) == PRISM_ERR, "zadd rejects an empty score");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 4, "setbit", "edge-bits", "99999999999", "1");
+    CHECK(r && prism_type(r) == PRISM_ERR, "setbit rejects an offset beyond 2^32");
+    prism_reply_free(r);
+
+    prism_reply_free(prism_set(c, "edge-ttl", "v"));
+    prism_reply_free(prism_cmd(c, 3, "pexpire", "edge-ttl", "9223372036854775807"));
+    r = prism_pttl(c, "edge-ttl");
+    CHECK(r && prism_int(r) > 0, "huge pexpire saturates instead of expiring at once");
+    prism_reply_free(r);
+
+    r = prism_cmd(c, 3, "rename", "edge-ttl", "edge-ttl");
+    CHECK(r && prism_type(r) == PRISM_NIL, "rename onto itself succeeds");
+    prism_reply_free(r);
+    r = prism_get(c, "edge-ttl");
+    CHECK(r && prism_type(r) == PRISM_STR, "rename onto itself keeps the key");
+    prism_reply_free(r);
+
+    const char *keys[] = {"edge-list", "edge-z", "edge-ttl", "after-empty"};
+    for (const char *k : keys) prism_reply_free(prism_del(c, k));
+}
+
 int main(int argc, char **argv) {
     const char *server_path = "./build/prism-server";
     if (argc > 1) {
@@ -713,6 +755,7 @@ int main(int argc, char **argv) {
 
     test_basic_kv(c);
     test_empty_command(c);
+    test_edge_cases(c);
     test_del(c);
     test_ttl(c);
     test_keys(c);

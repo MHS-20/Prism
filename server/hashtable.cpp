@@ -125,7 +125,7 @@ size_t hm_size(HMap *hmap) {
 }
 
 static bool h_foreach(HTab *htab, bool (*f)(HNode *, void *), void *arg) {
-    for (size_t i = 0; htab->mask != 0 && i <= htab->mask; i++) {
+    for (size_t i = 0; htab->tab && i <= htab->mask; i++) {
         for (HNode *node = htab->tab[i]; node != NULL; node = node->next) {
             if (!f(node, arg)) {
                 return false;
